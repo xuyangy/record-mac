@@ -111,6 +111,21 @@ algorithm reimplemented from reading upstream code:
   (attribution, notice, source availability, license propagation) MUST be satisfied.
 - A newly introduced license conflict MUST be resolved before the code lands, not after.
 
+**Baseline and derivation modes.** open-recorder is the base application; QuickRecorder and
+Screenize are merged into it as components. Accordingly:
+
+- **open-recorder — vendored as the base.** Its application structure, editor, timeline, and
+  project format are the starting point.
+- **QuickRecorder — adapted.** Its capture engine supplies driver-free system audio loopback,
+  multi-track audio, and transparency-channel output.
+- **Screenize — adapted.** Its zoom planning, spring simulation, and activity analysis supply
+  the effects derived from recorded input, and their tests MUST be carried across with them.
+
+Once two other codebases are merged into it, tracking open-recorder upstream becomes costly.
+The project does NOT promise to stay mergeable with upstream. Divergence is expected and
+accepted, and a change MUST NOT be rejected solely because it complicates a future upstream
+merge.
+
 Rationale: combining three separately licensed codebases is the central legal fact of this
 project. Reconstructing provenance later, from memory, is not possible.
 
@@ -133,9 +148,10 @@ project. Reconstructing provenance later, from memory, is not possible.
 - **Export**: MP4 and MOV containers, H.264 and HEVC video, with selectable quality
   presets. Export resolution MUST support at least the capture resolution of any attached
   display, up to 4K.
-- **HEVC with alpha**: MUST be verified on the reference hardware before any feature
-  depends on it. If the T2 encode path cannot produce alpha, the feature plan MUST record
-  the fallback (software encode, or Apple Silicon only under the hardware-gating rule).
+- **HEVC with alpha**: verified available and hardware accelerated on the reference hardware.
+  Features MAY depend on it. Verification of alpha output MUST use the platform decoder, as
+  some third-party decoders ignore the auxiliary alpha layer and report a correct file as
+  opaque.
 - **Audio**: microphone and system audio MUST be independently selectable, independently
   level-adjustable, and exportable as separate tracks.
 - **Performance budget**: on the reference hardware, a 10-minute capture at the display's
@@ -188,4 +204,4 @@ and after design. Violations are either fixed or recorded as explicitly justifie
 exceptions with the simpler alternative that was rejected and why. An unjustified violation
 blocks the change.
 
-**Version**: 1.2.0 | **Ratified**: 2026-09-11 | **Last Amended**: 2026-09-11
+**Version**: 1.3.0 | **Ratified**: 2026-09-11 | **Last Amended**: 2026-09-11

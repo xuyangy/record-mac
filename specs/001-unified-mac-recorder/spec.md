@@ -316,8 +316,8 @@ from inside the application.
   capture and hardware can produce, and MUST offer quality presets.
 - **FR-054**: System MUST offer a choice of color handling appropriate to standard and
   wide-gamut delivery.
-- **FR-055**: System MUST support exporting video with a transparency channel where the
-  hardware can produce it, and MUST state clearly when it cannot.
+- **FR-055**: System MUST support exporting video with a transparency channel. On hardware
+  that cannot produce one, this degrades under FR-071 rather than failing silently.
 - **FR-056**: System MUST export screenshots as still images to a file or the clipboard.
 - **FR-057**: System MUST show export progress and allow cancellation.
 - **FR-058**: Users MUST be able to save and reuse export presets.
@@ -468,9 +468,13 @@ license and attribution obligations the project constitution requires.
 - **Frame rate** targets 30 and 60 frames per second. Screenize advertises up to 240fps, which
   this hardware will not sustain alongside live preview and activity recording, so it is not
   promised.
-- **Transparency-channel export** is assumed available through the reference machine's hardware
-  encoder but is not yet verified. If verification fails, FR-055 is satisfied by stating the
-  limitation and offering the nearest alternative, per FR-071.
+- **Transparency-channel export is verified available** on the reference hardware, hardware
+  accelerated. The platform exposes a hardware muxed-alpha HEVC encoder; a compression session
+  that requires hardware acceleration is created successfully, and an encode-then-decode round
+  trip preserves transparent and opaque regions exactly. Acceptance testing for FR-055 must use
+  the platform decoder: some third-party decoders ignore the auxiliary alpha layer and render
+  the base layer as opaque, which looks like a broken export but is a property of those
+  decoders, not of the file.
 - **Continuity camera and desk view** availability on Intel hardware is assumed from operating
   system support rather than verified; if absent, FR-010 degrades under FR-071.
 - **Badges and ripples are rendered, not captured.** Screenize draws them on screen during
