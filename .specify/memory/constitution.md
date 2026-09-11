@@ -90,16 +90,26 @@ would allow. The only defensible design is one where that is structurally imposs
 
 ### V. Upstream Attribution and License Compliance (NON-NEGOTIABLE)
 
-This project draws on open-recorder, QuickRecorder, and Screenize. For any change derived
-from an upstream project — copied source, adapted source, or an algorithm reimplemented
-from reading upstream code:
+This project is licensed AGPL-3.0. QuickRecorder is AGPL-3.0 while open-recorder and
+Screenize are Apache-2.0; Apache-2.0 material may be incorporated into an AGPL-3.0 work but
+not the reverse, so AGPL-3.0 is the only license under which all three may be combined.
+Therefore:
+
+- Code from open-recorder, QuickRecorder, or Screenize MAY be reused or adapted directly.
+- New code in this repository is AGPL-3.0. A dependency under a license incompatible with
+  AGPL-3.0 MUST NOT be added.
+- If the application is ever distributed to anyone, complete corresponding source MUST be
+  offered to the recipient. Personal, undistributed use triggers no source-offer obligation,
+  but the license terms govern the code regardless.
+
+For any change derived from an upstream project — copied source, adapted source, or an
+algorithm reimplemented from reading upstream code:
 
 - The upstream project, its license, and the derivation mode (vendored, adapted, or
   reimplemented) MUST be recorded in the repository before the change merges.
 - The upstream license text MUST be retained in the repository, and its obligations
   (attribution, notice, source availability, license propagation) MUST be satisfied.
-- Where upstream licenses conflict with each other or with this project's own license, the
-  conflict MUST be resolved before the code lands, not after.
+- A newly introduced license conflict MUST be resolved before the code lands, not after.
 
 Rationale: combining three separately licensed codebases is the central legal fact of this
 project. Reconstructing provenance later, from memory, is not possible.
@@ -178,4 +188,4 @@ and after design. Violations are either fixed or recorded as explicitly justifie
 exceptions with the simpler alternative that was rejected and why. An unjustified violation
 blocks the change.
 
-**Version**: 1.1.0 | **Ratified**: 2026-09-11 | **Last Amended**: 2026-09-11
+**Version**: 1.2.0 | **Ratified**: 2026-09-11 | **Last Amended**: 2026-09-11
