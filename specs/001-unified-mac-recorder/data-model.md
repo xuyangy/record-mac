@@ -74,7 +74,10 @@ One immutable media file, written in the format its device delivered.
   changes. A `camera` track starts a new segment on each camera switch, at the new device's
   native size and frame rate. No frame is scaled, cropped, or re-encoded at capture; render maps
   each segment to the output (Principle I).
-- `microphone` and `systemAudio` tracks start a new segment only if the audio format changes.
+- `microphone` and `systemAudio` tracks start a new segment when the audio format changes, when
+  the input device changes, and after any interruption, including a device that disconnects and
+  returns in the same format. The interruption is the gap between the two segments; no silence is
+  written to fill it.
 - A `presenterComposite` track exists only when the creator asked to keep the Presenter Overlay
   composite and the two-stream design is in use. It has one segment per stretch the overlay was
   on, alongside a `screen` and a `camera` track covering the same time. It is never the source

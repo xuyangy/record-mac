@@ -437,8 +437,9 @@ from inside the application.
 - **SC-001**: A creator records a ten-minute tutorial and publishes a video that meets User
   Story 2 acceptance scenario 2 without opening any other application.
 - **SC-002**: A ten-minute recording of the reference machine's built-in display at its full
-  panel resolution of 3456x2234 pixels loses no more than 1% of the frames the display showed,
-  at 60 and at 120 frames per second, and the live preview causes none of that loss.
+  panel resolution of 3456x2234 pixels loses no more than 1% of the distinct frames the source
+  showed at the requested rate, at 60 and at 120 frames per second with the display at its
+  normal refresh, and the live preview causes none of that loss.
 - **SC-013**: With Presenter Overlay on for a ten-minute recording, the project holds a separate
   camera recording playable on its own, and a screen recording that is either clean throughout
   or has every overlaid stretch marked; no overlaid frame is presented as clean.

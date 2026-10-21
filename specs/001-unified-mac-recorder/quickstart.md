@@ -61,8 +61,10 @@ swift test --filter 'ProjectFormatTests|ProjectMigrationTests|AutosaveAtomicityT
 Then by hand:
 
 1. Record 10 minutes with camera, microphone, and system audio on.
-2. Confirm `media/` holds `screen-1.mov`, `camera-1.mov`, `microphone.m4a`, and `system.m4a`
-   as separate files, and that `project.json` lists each with its segment times.
+2. Confirm `media/` holds `screen-1.mov`, `camera-1.mov`, `microphone-1.m4a`, and
+   `system-1.m4a` as separate files, and that `project.json` lists each with its segment times.
+   Unplug and replug the microphone once during the recording: `microphone-2.m4a` must follow,
+   with the gap between the two recorded in `project.json` and no silence filled in.
 3. Note the hash of each media file: `shasum media/*`.
 4. Edit heavily — split, change speed, move zooms, restyle the background — then export.
 5. Re-run `shasum media/*`. **Every hash must be unchanged.** A changed hash fails Principle I.
@@ -74,17 +76,20 @@ Measured end to end against what the display showed, not only against what the a
 
 1. Switch the built-in display to the mode that looks like 1728x1117, so its backing store is
    the full 3456x2234 panel.
-2. Run the frame-ID fixture: a test animation that draws a frame number on every display
-   refresh, with the frame numbers actually shown logged at the display as the baseline.
-3. Record 10 minutes of the fixture with preview visible, once at 60 fps and once at 120 fps.
+2. Leave the display at its normal refresh. Run the frame-ID fixture at the rate under test: its
+   frame number advances once per capture interval, aligned to display refreshes — every
+   refresh at 120 fps, every second refresh at 60 fps — and the distinct frame numbers it
+   presented are logged at the display as the baseline.
+3. Record 10 minutes of the fixture with preview visible, once with fixture and capture at
+   60 fps and once with both at 120 fps.
 4. Decode each finalised screen track and read back the frame numbers.
 
 Record, for each run: panel pixels, source pixels, and the stream output size read from the
 frames; the display mode; and the four engine counters — delivered, append-rejected,
 writer-failed, written.
 
-- Pass: at each rate, no more than 1% of the frame numbers the display showed are missing from
-  the decoded file, and no loss is attributable to preview.
+- Pass: at each rate, no more than 1% of the distinct frame numbers the fixture presented at
+  that rate are missing from the decoded file, and no loss is attributable to preview.
 - Fail: anything higher. The reference machine is the fastest supported Mac, so a pass here is
   necessary, not sufficient, for slower Apple Silicon.
 
@@ -121,11 +126,14 @@ unmodified:
 scripts/check-generator-suites.sh
 ```
 
-The script fails unless every one of these suites appears in `swift test list` and then passes:
-`SpringDamperSimulator`, `WaypointGenerator`, `AdaptiveResponse`, `MicroTracker`,
-`DeadZoneTarget`, `StartupCameraPolicy`, `SegmentPlanner`, `SegmentSpringSimulator`,
-`ShotPlanner`, `IntentClassifier`, `EventTimeline`, `EventStreamAdapter`. A missing suite is a
-failure, so a partial import cannot pass on a nonzero count.
+The script fails unless every one of these 17 suites appears in `swift test list` and then
+passes: `SpringDamperSimulatorTests`, `WaypointGeneratorTests`, `AdaptiveResponseTests`,
+`MicroTrackerTests`, `DeadZoneTargetTests`, `StartupCameraPolicyTests`,
+`ContinuousCameraGeneratorTests`, `SegmentPlannerTests`, `SegmentSpringSimulatorTests`,
+`SegmentCameraGeneratorTests`, `ShotPlannerTests`, `IntentClassifierTests`,
+`EventTimelineTests`, `CursorTrackEmitterTests`, `KeystrokeTrackEmitterTests`,
+`SmoothedMouseDataSourceTests`, `EventStreamAdapterTests`. A missing suite is a failure, so a
+partial import cannot pass on a nonzero count.
 
 A failure is first investigated at the telemetry adapter, which is the usual cause. Import and
 module wiring in a vendored test may change; its assertions may not.
@@ -217,7 +225,7 @@ closes it.
 | Item | Phase | Fixture | Method | Pass rule |
 |---|---|---|---|---|
 | SC-001 | 9 | 10-min tutorial | end-to-end pass above | export meets US2 scenario 2; no other app opened |
-| SC-002 / Gate 3 | 3, 9 | frame-ID fixture, 10 min at 3456x2234, 60 and 120 fps, preview on | decoded frame numbers vs display baseline | ≤ 1% lost at each rate, none from preview |
+| SC-002 / Gate 3 | 3, 9 | frame-ID fixture, 10 min at 3456x2234, 60 and 120 fps, preview on | decoded frame numbers vs the distinct numbers the fixture presented at the requested rate | ≤ 1% lost at each rate, none from preview |
 | SC-003 | 9 | cold start, permissions granted | count interactions to recording | ≤ 3 |
 | SC-004 | 9 | 10-min recording | time from stop to editor ready | ≤ 5 s |
 | SC-005 | 9 | fixed click-driven corpus recording | owner reviews generated zooms | unchanged / total ≥ 80% |
@@ -231,6 +239,6 @@ closes it.
 | SC-013 / Gate 9 | 3, 9 | 10-min recording, overlay toggled | check every screen frame and `overlaidRanges` | camera intact; no composited frame outside `overlaidRanges` |
 | Gate 2 | 2, 3 | 10-min recording | tests + hashes | hashes unchanged |
 | Gate 4 | 7 | alpha and ProRes export | `AlphaExportTests`, `ProResExportTests` | alpha preserved by platform decoder |
-| Gate 6 | 2 | vendored suites | command above | nonzero count, all pass |
+| Gate 6 | 2 | vendored suites | command above | all 17 suites present, all pass |
 | Gate 7 | 4 | click-heavy recording | regenerate after manual edit | manual move unchanged |
 | Gate 10 | 3, 7 | offers per display; 30-s fixture at 120 fps; static screen | `FrameRateTests` + decoded frame numbers | offers match refresh; shown frames present once; duration kept; exported at source rate |

@@ -92,18 +92,33 @@ a Rust toolchain to every build for one file.
 
 **Decision**: Carry `Screenize/Generators/**` across unchanged and adapt at the boundary.
 
-**Evidence**: The generators are isolated pure logic with dedicated tests:
+**Evidence**: The generators carry dedicated tests, 17 suites in all:
 
-| Module | Purpose | Test file present |
+| Module | Purpose | Test suite |
 |---|---|---|
-| `ContinuousCamera/SpringDamperSimulator` | pointer-following zoom physics | yes |
-| `ContinuousCamera/WaypointGenerator` | zoom waypoints | yes |
-| `ContinuousCamera/AdaptiveResponse`, `MicroTracker`, `DeadZoneTarget`, `StartupCameraPolicy` | tracking behaviour | yes, each |
-| `SegmentCamera/SegmentPlanner`, `SegmentSpringSimulator` | planned zoom segments | yes |
-| `SmartGeneration/Analysis/IntentClassifier`, `EventTimeline` | what the user was doing | yes |
-| `SmartGeneration/Planning/ShotPlanner` | shot planning | yes |
-| `SmartGeneration/Emission/CursorTrackEmitter`, `KeystrokeTrackEmitter` | overlay emission | — |
+| `ContinuousCamera/SpringDamperSimulator` | pointer-following zoom physics | `SpringDamperSimulatorTests` |
+| `ContinuousCamera/WaypointGenerator` | zoom waypoints | `WaypointGeneratorTests` |
+| `ContinuousCamera/AdaptiveResponse`, `MicroTracker`, `DeadZoneTarget`, `StartupCameraPolicy` | tracking behaviour | one suite each |
+| `ContinuousCamera/ContinuousCameraGenerator` | pointer-following generator | `ContinuousCameraGeneratorTests` |
+| `SegmentCamera/SegmentPlanner`, `SegmentSpringSimulator` | planned zoom segments | one suite each |
+| `SegmentCamera/SegmentCameraGenerator` | planned-segment generator | `SegmentCameraGeneratorTests` |
+| `SmartGeneration/Analysis/IntentClassifier`, `EventTimeline` | what the user was doing | one suite each |
+| `SmartGeneration/Planning/ShotPlanner` | shot planning | `ShotPlannerTests` |
+| `SmartGeneration/Emission/CursorTrackEmitter`, `KeystrokeTrackEmitter` | ripple and keystroke-badge emission | one suite each |
+| `SmartGeneration/SmoothedMouseDataSource` | pointer smoothing input | `SmoothedMouseDataSourceTests` |
+| `Models/EventStreamAdapter` | event model seam | `EventStreamAdapterTests` |
 | `SmartGeneration/Types/UnifiedEvent`, `Scene`, `ShotPlan`, `UserIntent`, `TimedTransform` | the telemetry and plan model | — |
+
+`KeystrokeTrackEmitterTests` is upstream coverage for keystroke-to-badge mapping, one of the
+tests the constitution requires.
+
+The generators are not self-contained. Following every type they and their tests reference
+reaches 49 further Screenize files: its timeline model (`Timeline/`), event and project models
+(`Models/`, `Project/`), much of its render engine (`Render/`), coordinate and accessibility
+helpers (`Core/`), and localisation and logging (`App/L10n.swift`, `App/Log.swift`,
+`App/AppLanguageManager.swift`). They import only Apple frameworks, and none makes a network call.
+Screenize's only Sparkle imports, `ScreenizeApp.swift` and `App/SparkleController.swift`, are
+outside that set. The list is an upper bound; the first build shows which files are unused.
 
 **Rationale**: the constitution's quality gate requires automated tests for exactly this logic.
 Rewriting the generators would discard the tests that satisfy it.
@@ -327,11 +342,15 @@ presentation duration extends to cover them, including the final hold and record
 change at all.
 
 App-side counters cannot see a frame ScreenCaptureKit never delivered. SC-002 is therefore
-measured end to end with a frame-ID fixture: a test animation draws a frame number on every
-display refresh. The baseline is the set of frame numbers the display actually showed, measured
-at the display, so a producer that itself misses a refresh is not blamed on the recorder. Loss
-is the share of shown frame numbers missing from the decoded file. Producer, delivered, written,
-and decoded measurements are kept distinct.
+measured end to end with a frame-ID fixture: a test animation whose frame number advances once
+per capture interval at the requested rate, aligned to display refreshes — every refresh for a
+120 fps run on the 120 Hz panel, every second refresh for a 60 fps run. The display keeps its
+normal refresh, because a 60 fps capture of a 120 Hz desktop is the ordinary case the budget must
+cover. The baseline is the set of distinct frame numbers the fixture actually presented, logged
+at the display, so a producer that itself misses a refresh is not blamed on the recorder. Loss is
+the share of those distinct numbers missing from the decoded file. Producer, delivered, written,
+and decoded measurements are kept distinct. Setting the panel to 60 Hz for the 60 fps run would
+also be correct, but would measure a display mode creators do not record in.
 
 **Evidence**: on the reference machine, `NSScreen.maximumFramesPerSecond` reports 120 for the
 built-in display and 60 for an attached Dell U3419W. ScreenCaptureKit delivers a new frame only

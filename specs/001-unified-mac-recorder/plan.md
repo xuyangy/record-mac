@@ -41,7 +41,8 @@ Apple M5 Pro, 48 GB, built-in display up to 120 Hz, macOS 27.0.1
 **Project Type**: Native macOS desktop application, single SwiftPM executable target
 
 **Performance Goals**: 10-minute capture of the built-in display at its full 3456x2234 panel
-resolution, at 60 and at 120 fps, losing no more than 1% of the frames the display showed,
+resolution, at 60 and at 120 fps, losing no more than 1% of the distinct frames the source showed
+at the requested rate,
 measured end to end with a frame-ID fixture (research.md R-011); preview never the cause of a
 lost frame; export of a 10-minute 1080p recording within 2x real time
 

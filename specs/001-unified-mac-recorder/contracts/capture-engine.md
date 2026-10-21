@@ -85,7 +85,9 @@ source has already disappeared.
    the recording (FR-074, SC-002, research.md R-011).
 9. **Native segments.** A change of the source's pixel size or pixel format ends the current
    screen segment and starts a new one at the new format; captured frames are never rescaled to
-   keep one file. A camera switch does the same for the camera. Where a source cannot deliver
+   keep one file. A camera switch does the same for the camera. An audio track starts a new
+   segment on a format change, a device change, or after any interruption, including a
+   same-format reconnect. Where a source cannot deliver
    continuously across the change, the gap is recorded as a gap, never filled with synthetic
    frames.
 10. **Presenter Overlay never presents a composite as clean.** While the overlay is engaged on

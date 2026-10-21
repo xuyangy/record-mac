@@ -13,8 +13,9 @@ How a RecordingProject is laid out on disk. Versioned, with migration required (
 │   │                     # or pixel-format change)
 │   ├── camera-1.mov      # present only if the camera was on; one file per camera
 │   │                     # segment (camera-2.mov, … after each switch)
-│   ├── microphone.m4a
-│   ├── system.m4a
+│   ├── microphone-1.m4a  # one file per microphone segment (microphone-2.m4a, … after a
+│   │                     # format change, device change, or interruption)
+│   ├── system-1.m4a      # one file per system audio segment, by the same rule
 │   └── presenter-composite-1.mov  # present only if the creator kept the overlay composite;
 │                                  # one file per stretch the overlay was on
 ├── activity.json         # the frozen ActivityStream and its GeometrySegments
