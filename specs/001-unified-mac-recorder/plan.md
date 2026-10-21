@@ -178,8 +178,10 @@ not carried over; see research.md R-003.
 Screenize's generators need part of Screenize's own model and render code to compile; that code
 is carried under `Generators/Support/` as dormant support for the generators and is never wired
 into preview, playback, or export. The carried set is settled by a bounded extraction that cuts
-the compatibility extension linking it to Screenize's preview engine (research.md R-004), and a
-release-gate scan keeps any code outside `Generators/` from reaching the carried render types.
+the compatibility extension linking it to Screenize's preview engine (research.md R-004). A
+release-gate scan fails on any direct reference to the carried render types from production code
+outside `Generators/`; it does not follow the call graph, so review also checks that nothing
+under `Generators/` wraps a carried renderer for use elsewhere.
 Wiring Screenize's renderer into the application would need this plan amended first.
 
 ## Complexity Tracking

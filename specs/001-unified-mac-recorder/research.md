@@ -126,9 +126,14 @@ Two links decide how much of Screenize comes with them:
   carrying it pulls in `PreviewEngine` and through it `RenderCoordinator`, audio playback, the
   frame readers, and `ScreenizeProject` — Screenize's whole preview stack. Cutting that one
   extension keeps all of it out.
-- `SmartGeneration/Planning/ShotPlanner.swift` takes `[VideoFrameAnalyzer.FrameAnalysis]`, a value
-  type nested inside the actor that reads video. Moving the value type out lets the generators
-  stay free of video analysis without changing the algorithm.
+- Five generator files — `ShotPlanner`, `WaypointGenerator`, `SegmentPlanner`,
+  `ContinuousCameraGenerator`, and `SegmentCameraGenerator` — take
+  `[VideoFrameAnalyzer.FrameAnalysis]` in 11 places, a value type nested inside the actor that
+  reads video. Moving the value type out, and spelling every generator reference with the
+  standalone name, lets the generators stay free of video analysis without changing the
+  algorithm. The move keeps the whole declaration, including its custom equality, which compares
+  `time` only (`Analysis/VideoFrameAnalyzer.swift:21-23`); a synthesized equality would change
+  behaviour.
 
 A reference scan cannot see method dependencies — for example `PreviewEngine.swift` calls
 `setupCallbacks()`, defined in `PreviewEngine+Setup.swift` — so the 37 files are an upper bound,
