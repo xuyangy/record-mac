@@ -1,0 +1,952 @@
+import AppKit
+import Carbon.HIToolbox
+import Combine
+import SwiftUI
+
+@MainActor
+final class OpenRecorderAppDelegate: NSObject, NSApplicationDelegate {
+    private weak var model: AppModel?
+    private var pendingFileURLs: [URL] = []
+    private let windowActions = AppWindowActions()
+    private let hudPanelController = HUDPanelController()
+    private let statusItemController = OpenRecorderStatusItemController()
+    private let hotKeyController = GlobalRecordingHotKeyController()
+    private var terminationTask: Task<Void, Never>?
+    private var didBootstrapModel = false
+
+    func attach(model: AppModel) {
+        if self.model !== model {
+            self.model = model
+            hudPanelController.attach(model: model)
+            statusItemController.attach(model: model, windowActions: windowActions)
+            hotKeyController.attach(model: model)
+            model.installNativeWindowCommandHandler { [weak self] command in
+                self?.handleWindowCommand(command)
+            }
+        } else {
+            self.model = model
+            hudPanelController.attach(model: model)
+        }
+        pendingFileURLs.append(contentsOf: launchArgumentFileURLs())
+        flushPendingFileURLs()
+        handleWindowCommand(model.windowCommand)
+        if !didBootstrapModel {
+            didBootstrapModel = true
+            model.bootstrap()
+        }
+    }
+
+    var isCameraEnabled: Bool {
+        guard let model else { return false }
+        return model.includeCamera
+    }
+
+    func installWindowActions(
+        openWindow: @escaping (String) -> Void,
+        openEditor: @escaping (EditorSession) -> Void,
+        dismissWindow: @escaping (String) -> Void,
+        openSettings: @escaping () -> Void,
+        shouldKeepCameraBubble: @escaping () -> Bool = { false }
+    ) {
+        windowActions.install(
+            openWindow: { [weak self] id in
+                if id == "hud" {
+                    self?.hudPanelController.show()
+                } else {
+                    openWindow(id)
+                }
+            },
+            openEditor: openEditor,
+            dismissWindow: { [weak self] id in
+                if id == "hud" {
+                    self?.hudPanelController.hide()
+                } else {
+                    dismissWindow(id)
+                }
+            },
+            openSettings: openSettings,
+            shouldKeepCameraBubble: shouldKeepCameraBubble
+        )
+        handleWindowCommand(model?.windowCommand)
+    }
+
+    func application(_ sender: NSApplication, openFiles filenames: [String]) {
+        pendingFileURLs.append(contentsOf: filenames.map { URL(fileURLWithPath: $0) })
+        flushPendingFileURLs()
+        sender.reply(toOpenOrPrint: .success)
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard let model else { return .terminateNow }
+        guard terminationTask == nil else { return .terminateLater }
+
+        terminationTask = Task { [weak self, weak model] in
+            let canTerminate = await model?.prepareForTermination() ?? true
+            self?.terminationTask = nil
+            if !canTerminate {
+                sender.activate(ignoringOtherApps: true)
+            }
+            sender.reply(toApplicationShouldTerminate: canTerminate)
+        }
+        return .terminateLater
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        hotKeyController.detach()
+    }
+
+    private func flushPendingFileURLs() {
+        guard let model else { return }
+        let urls = pendingFileURLs
+        pendingFileURLs.removeAll()
+        urls.forEach { model.openEditorFile(at: $0) }
+    }
+
+    private func handleWindowCommand(_ command: NativeWindowCommand?) {
+        if let action = command?.action, action == .showStudio {
+            facecamLog.notice("AppDelegate.handleWindowCommand(.showStudio) isInstalled=\(self.windowActions.isInstalled, privacy: .public) modelPresent=\(self.model != nil, privacy: .public)")
+        }
+        guard windowActions.isInstalled,
+              let model,
+              let command = model.consumeWindowCommand(command) else {
+            return
+        }
+
+        windowActions.perform(command)
+    }
+
+    private func launchArgumentFileURLs() -> [URL] {
+        CommandLine.arguments.dropFirst().compactMap { argument in
+            let url = URL(fileURLWithPath: argument)
+            guard Self.canOpenFile(at: url) else {
+                return nil
+            }
+            return url
+        }
+    }
+
+    private static func canOpenFile(at url: URL) -> Bool {
+        url.pathExtension.lowercased() == "openrecorder"
+            || EditorMediaKind.screenshot.supports(url)
+            || EditorMediaKind.video.supports(url)
+    }
+}
+
+@main
+struct OpenRecorderApp: App {
+    @NSApplicationDelegateAdaptor(OpenRecorderAppDelegate.self) private var appDelegate
+    @StateObject private var model = AppModel(
+        captureSetupPreferencesStore: .live,
+        editorAppearancePreferencesStore: .live
+    )
+
+    var body: some Scene {
+        let _ = appDelegate.attach(model: model)
+
+        WindowGroup("Open Recorder Host", id: "hud-host") {
+            Color.clear
+                .frame(width: 240, height: 120)
+                .background(AppWindowActionBridge(appDelegate: appDelegate))
+                .background(HUDHostWindowHider())
+        }
+        .windowStyle(.hiddenTitleBar)
+        .defaultLaunchBehavior(.presented)
+        .restorationBehavior(.disabled)
+        .defaultSize(width: 240, height: 120)
+
+        Window("Open Recorder Setup", id: "onboarding") {
+            ContentView(role: .onboarding)
+                .environmentObject(model)
+                .background(AppWindowActionBridge(appDelegate: appDelegate))
+                .frame(width: OnboardingWindowMetrics.width, height: OnboardingWindowMetrics.height)
+        }
+        .windowResizability(.contentSize)
+        .defaultLaunchBehavior(.suppressed)
+        .restorationBehavior(.disabled)
+        .defaultSize(width: OnboardingWindowMetrics.width, height: OnboardingWindowMetrics.height)
+
+        Window("Choose Source", id: "source-selector") {
+            ContentView(role: .sourceSelector)
+                .environmentObject(model)
+                .background(AppWindowActionBridge(appDelegate: appDelegate))
+        }
+        .windowResizability(.contentSize)
+        .defaultLaunchBehavior(.suppressed)
+        .restorationBehavior(.disabled)
+        .defaultSize(width: SourceSelectorWindowMetrics.width, height: SourceSelectorWindowMetrics.compactHeight)
+
+        Window("Choose Microphone", id: "microphone-selector") {
+            ContentView(role: .microphoneSelector)
+                .environmentObject(model)
+                .background(AppWindowActionBridge(appDelegate: appDelegate))
+        }
+        .windowResizability(.contentSize)
+        .defaultLaunchBehavior(.suppressed)
+        .defaultSize(width: CaptureDeviceSelectorWindowMetrics.width, height: CaptureDeviceSelectorWindowMetrics.height)
+
+        Window("Choose Camera", id: "camera-selector") {
+            ContentView(role: .cameraSelector)
+                .environmentObject(model)
+                .background(AppWindowActionBridge(appDelegate: appDelegate))
+        }
+        .windowResizability(.contentSize)
+        .defaultLaunchBehavior(.suppressed)
+        .defaultSize(width: CaptureDeviceSelectorWindowMetrics.width, height: CaptureDeviceSelectorWindowMetrics.height)
+
+        Window("Camera Bubble", id: "camera-bubble") {
+            ContentView(role: .cameraBubble)
+                .environmentObject(model)
+                .background(AppWindowActionBridge(appDelegate: appDelegate))
+        }
+        .windowStyle(.hiddenTitleBar)
+        .windowResizability(.contentSize)
+        .defaultLaunchBehavior(.suppressed)
+        .restorationBehavior(.disabled)
+
+        Window("Open Recorder Editor", id: "studio") {
+            ContentView(role: .studio)
+                .environmentObject(model)
+                .background(AppWindowActionBridge(appDelegate: appDelegate))
+                .frame(minWidth: 800, minHeight: 600)
+        }
+        .defaultSize(width: 1200, height: 800)
+
+        WindowGroup("Open Recorder Editor", id: "editor", for: EditorSession.self) { $session in
+            ContentView(role: .studio, editorSession: session)
+                .environmentObject(model)
+                .background(AppWindowActionBridge(appDelegate: appDelegate))
+                .frame(minWidth: 800, minHeight: 600)
+        }
+        .defaultSize(width: 1200, height: 800)
+        .commands {
+            CommandGroup(replacing: .newItem) {
+                Button("New Recording") {
+                    beginCapture(.recording)
+                }
+                .keyboardShortcut("n", modifiers: [.command])
+                .disabled(!model.canStartNewCapture)
+
+                Button("New Screenshot") {
+                    beginCapture(.screenshot)
+                }
+                .keyboardShortcut("n", modifiers: [.command, .shift])
+                .disabled(!model.canStartNewCapture)
+
+                Button("Toggle Recording") {
+                    model.toggleRecordingShortcut()
+                }
+
+                Button("Open Project...") {
+                    model.openProjectFile()
+                }
+                .keyboardShortcut("o", modifiers: [.command])
+
+                Divider()
+
+                Button("Show Projects") {
+                    model.selectedSection = .projects
+                    model.requestWindow(.showStudio)
+                }
+                .keyboardShortcut("1", modifiers: [.command])
+
+                Button("Show Editor") {
+                    model.selectedSection = .editor
+                    model.requestWindow(.showStudio)
+                }
+                .keyboardShortcut("2", modifiers: [.command])
+            }
+
+            // Without this, SwiftUI auto-populates the "Window" menu with every declared
+            // Window scene by title, including internal tool windows like "Camera Bubble"
+            // and the capture selectors. Selecting one from that menu (or
+            // triggering it via Mission Control/window cycling) opens it directly, bypassing
+            // requestWindow()'s includeCamera gating entirely.
+            CommandGroup(replacing: .windowList) {}
+        }
+
+        Settings {
+            SettingsView()
+                .environmentObject(model)
+                .frame(width: SettingsWindowMetrics.width, height: SettingsWindowMetrics.height)
+                .preferredColorScheme(.dark)
+        }
+    }
+
+    private func beginCapture(_ mode: CaptureMode) {
+        model.beginCapture(mode)
+    }
+}
+
+private struct AppWindowActionBridge: View {
+    @Environment(\.openWindow) private var openWindow
+    @Environment(\.dismissWindow) private var dismissWindow
+    @Environment(\.openSettings) private var openSettings
+    let appDelegate: OpenRecorderAppDelegate
+
+    var body: some View {
+        Color.clear
+            .frame(width: 1, height: 1)
+            .onAppear {
+                appDelegate.installWindowActions(
+                    openWindow: { id in openWindow(id: id) },
+                    openEditor: { session in openWindow(id: "editor", value: session) },
+                    dismissWindow: { id in dismissWindow(id: id) },
+                    openSettings: { openSettings() },
+                    shouldKeepCameraBubble: { [weak appDelegate] in
+                        appDelegate?.isCameraEnabled ?? false
+                    }
+                )
+            }
+    }
+}
+
+@MainActor
+final class AppWindowActions {
+    private(set) var isInstalled = false
+    private var openWindow: (String) -> Void = { _ in }
+    private var openEditor: (EditorSession) -> Void = { _ in }
+    private var dismissWindow: (String) -> Void = { _ in }
+    private var openSettings: () -> Void = {}
+    private var shouldKeepCameraBubble: () -> Bool = { false }
+    private var hideApp: () -> Void = {
+        NSApplication.shared.hide(nil)
+    }
+    private var unhideApp: () -> Void = {
+        NSApplication.shared.unhide(nil)
+    }
+    private var activateApp: () -> Void = {
+        NSApplication.shared.activate(ignoringOtherApps: true)
+    }
+
+    func install(
+        openWindow: @escaping (String) -> Void,
+        openEditor: @escaping (EditorSession) -> Void,
+        dismissWindow: @escaping (String) -> Void,
+        openSettings: @escaping () -> Void = {},
+        shouldKeepCameraBubble: @escaping () -> Bool = { false },
+        activateApp: @escaping () -> Void = {
+            NSApplication.shared.activate(ignoringOtherApps: true)
+        },
+        hideApp: @escaping () -> Void = {
+            NSApplication.shared.hide(nil)
+        },
+        unhideApp: @escaping () -> Void = {
+            NSApplication.shared.unhide(nil)
+        }
+    ) {
+        self.openWindow = openWindow
+        self.openEditor = openEditor
+        self.dismissWindow = dismissWindow
+        self.openSettings = openSettings
+        self.shouldKeepCameraBubble = shouldKeepCameraBubble
+        self.activateApp = activateApp
+        self.hideApp = hideApp
+        self.unhideApp = unhideApp
+        isInstalled = true
+    }
+
+    func open(_ id: String) {
+        openWindow(id)
+    }
+
+    func dismiss(_ id: String) {
+        dismissWindow(id)
+    }
+
+    func openEditorSession(_ session: EditorSession) {
+        openEditor(session)
+    }
+
+    func showSettings() {
+        unhideApp()
+        openSettings()
+        activateApp()
+    }
+
+    func perform(_ command: NativeWindowCommand) {
+        switch command.action {
+        case .showHUD:
+            unhideApp()
+            openWindow("hud")
+        case .hideHUD:
+            dismissWindow("hud")
+        case .showOnboarding:
+            unhideApp()
+            dismissWindow("hud")
+            dismissWindow("source-selector")
+            openWindow("onboarding")
+            activateApp()
+        case .finishOnboarding:
+            unhideApp()
+            dismissWindow("onboarding")
+            openWindow("hud")
+            activateApp()
+        case .showRecordingSetup:
+            unhideApp()
+            openWindow("hud")
+            openWindow("source-selector")
+            activateApp()
+        case .showScreenRecordingSetup:
+            unhideApp()
+            dismissWindow("source-selector")
+            openWindow("hud")
+        case .hideRecordingSetup:
+            dismissCaptureWindows()
+        case .hideAppWindowsForCapture:
+            hideAppWindowsForCapture()
+        case .showSourceSelector:
+            unhideApp()
+            openWindow("source-selector")
+        case .showMicrophoneSelector:
+            unhideApp()
+            openWindow("microphone-selector")
+        case .showCameraSelector:
+            unhideApp()
+            openWindow("camera-selector")
+        case .showCameraBubble:
+            openWindow("camera-bubble")
+        case .closeCameraBubble:
+            dismissWindow("camera-bubble")
+        case .showStudio:
+            facecamLog.notice("AppWindowActions.perform(.showStudio) hasSession=\(command.editorSession != nil, privacy: .public)")
+            unhideApp()
+            dismissWindow("hud")
+            dismissCaptureWindows(alwaysDismissCameraBubble: true)
+            if let editorSession = command.editorSession {
+                openEditor(editorSession)
+            } else {
+                openWindow("studio")
+            }
+            activateApp()
+        case .closeCaptureSetup:
+            dismissWindow("source-selector")
+        case .closeSourceSelector:
+            dismissWindow("source-selector")
+        case .closeMicrophoneSelector:
+            dismissWindow("microphone-selector")
+        case .closeCameraSelector:
+            dismissWindow("camera-selector")
+        }
+    }
+
+    private func dismissCaptureWindows(alwaysDismissCameraBubble: Bool = false) {
+        // Deliberately does NOT dismiss "hud" — see callers. .hideRecordingSetup fires
+        // the moment the recording countdown starts (recordingCountdownStarted), well
+        // before recording actually begins; dismissing the HUD here hid it for the
+        // entire countdown + recording, with no way back short of the ⌘R global hotkey.
+        // Callers that genuinely need the HUD gone (e.g. .showStudio, once recording is
+        // fully over) dismiss it explicitly themselves.
+        dismissWindow("source-selector")
+        dismissWindow("microphone-selector")
+        dismissWindow("camera-selector")
+        if alwaysDismissCameraBubble || !shouldKeepCameraBubble() {
+            dismissWindow("camera-bubble")
+        }
+    }
+
+    private func hideAppWindowsForCapture() {
+        // NativeScreenRecorder already excludes this app's own process from the
+        // ScreenCaptureKit filter (excludingApplications:), so the app's windows never
+        // appear in the recorded output regardless of on-screen visibility — no need to
+        // hide anything at the OS level (hideApp) for that. dismissCaptureWindows()
+        // leaves "hud" alone, which matters here: this fires on both
+        // .recordingStarting and .recordingStarted, so it must not take down the
+        // recording HUD (Stop button, timer) the user needs for the rest of the
+        // recording.
+        dismissCaptureWindows()
+    }
+}
+
+@MainActor
+final class OpenRecorderStatusItemController: NSObject {
+    private var statusItem: NSStatusItem?
+    private weak var model: AppModel?
+    private var windowActions: AppWindowActions?
+    private var cancellables: Set<AnyCancellable> = []
+
+    init(model: AppModel? = nil, windowActions: AppWindowActions? = nil) {
+        self.model = model
+        self.windowActions = windowActions
+        super.init()
+    }
+
+    func attach(model: AppModel, windowActions: AppWindowActions) {
+        self.model = model
+        self.windowActions = windowActions
+
+        if statusItem == nil {
+            let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+            self.statusItem = statusItem
+            statusItem.button?.target = self
+            statusItem.button?.action = #selector(statusItemClicked)
+            statusItem.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
+        }
+
+        cancellables.removeAll()
+        model.objectWillChange
+            .sink { [weak self] _ in
+                DispatchQueue.main.async {
+                    self?.updateStatusItem()
+                }
+            }
+            .store(in: &cancellables)
+
+        updateStatusItem()
+    }
+
+    @objc private func statusItemClicked() {
+        guard let model else { return }
+
+        if isDirectStopState, NSApp.currentEvent?.type != .rightMouseUp {
+            model.toggleRecordingShortcut()
+            return
+        }
+
+        showMenu()
+    }
+
+    private var isDirectStopState: Bool {
+        guard let model else { return false }
+        return model.captureState.isDirectStopState(runtimeIsRecording: model.capture.isRecording)
+    }
+
+    private func updateStatusItem() {
+        guard let button = statusItem?.button else { return }
+
+        if isDirectStopState {
+            button.image = OpenRecorderMenuBarIcon.image
+            button.contentTintColor = .systemRed
+            let shortcut = model?.shortcutPreferences.item(for: .toggleRecording)
+            let hint = shortcut.flatMap { $0.isEnabled ? " (\($0.keyCombination.displayString))" : nil } ?? ""
+            button.toolTip = "Stop Recording\(hint)"
+            button.setAccessibilityLabel("Stop Recording")
+        } else {
+            button.image = OpenRecorderMenuBarIcon.image
+            button.contentTintColor = nil
+            button.toolTip = "Open Recorder"
+            button.setAccessibilityLabel("Open Recorder")
+        }
+    }
+
+    private func showMenu() {
+        guard let statusItem else { return }
+        let menu = makeMenu()
+
+        statusItem.menu = menu
+        statusItem.button?.performClick(nil)
+        statusItem.menu = nil
+    }
+
+    func makeMenu() -> NSMenu {
+        let menu = NSMenu()
+
+        if isDirectStopState {
+            menu.addItem(NSMenuItem(title: "Stop Recording", action: #selector(stopRecording), keyEquivalent: "r"))
+            menu.items.last?.keyEquivalentModifierMask = [.command]
+            menu.items.last?.target = self
+            menu.addItem(.separator())
+        }
+
+        let newRecording = NSMenuItem(title: "New Recording", action: #selector(newRecording), keyEquivalent: "")
+        newRecording.target = self
+        newRecording.isEnabled = model?.canStartNewCapture ?? false
+        menu.addItem(newRecording)
+
+        let newScreenshot = NSMenuItem(title: "New Screenshot", action: #selector(newScreenshot), keyEquivalent: "")
+        newScreenshot.target = self
+        newScreenshot.isEnabled = model?.canStartNewCapture ?? false
+        menu.addItem(newScreenshot)
+
+        menu.addItem(.separator())
+
+        for action in CaptureShortcutAction.allCases {
+            let item = NSMenuItem(title: action.title, action: #selector(captureShortcutSelected(_:)), keyEquivalent: "")
+            item.representedObject = action.rawValue
+            item.target = self
+            if let shortcut = model?.shortcutPreferences.item(for: action), shortcut.isEnabled {
+                item.title += "   \(shortcut.keyCombination.displayString)"
+            }
+            item.isEnabled = action == .toggleRecording || (model?.canStartNewCapture ?? false)
+            menu.addItem(item)
+        }
+        if model?.hasQuickScreenshot == true {
+            let item = NSMenuItem(title: "Edit Last Screenshot", action: #selector(editLastScreenshot), keyEquivalent: "")
+            item.target = self
+            menu.addItem(item)
+        }
+        menu.addItem(.separator())
+
+        let hudTitle = model?.isHUDVisible == true ? "Hide Recorder" : "Show Recorder"
+        let hudItem = NSMenuItem(title: hudTitle, action: #selector(toggleRecorderHUD), keyEquivalent: "")
+        hudItem.target = self
+        hudItem.isEnabled = model?.canShowCaptureUI ?? true
+        menu.addItem(hudItem)
+
+        if model?.lastEditorSession != nil {
+            let editorItem = NSMenuItem(title: "Show Last Editor", action: #selector(showLastEditor), keyEquivalent: "")
+            editorItem.target = self
+            menu.addItem(editorItem)
+        }
+
+        menu.addItem(.separator())
+
+        let settingsItem = NSMenuItem(title: "Settings…", action: #selector(showSettings), keyEquivalent: ",")
+        settingsItem.keyEquivalentModifierMask = [.command]
+        settingsItem.target = self
+        settingsItem.isEnabled = windowActions?.isInstalled == true && (model?.canStartNewCapture ?? false)
+        menu.addItem(settingsItem)
+
+        menu.addItem(.separator())
+
+        let quitItem = NSMenuItem(title: "Quit Open Recorder", action: #selector(quit), keyEquivalent: "q")
+        quitItem.keyEquivalentModifierMask = [.command]
+        quitItem.target = self
+        menu.addItem(quitItem)
+
+        return menu
+    }
+
+    @objc private func editLastScreenshot() { model?.editLastQuickScreenshot() }
+
+    @objc private func captureShortcutSelected(_ sender: NSMenuItem) {
+        guard let rawValue = sender.representedObject as? String, let action = CaptureShortcutAction(rawValue: rawValue) else { return }
+        switch action {
+        case .deviceScreenshot: model?.triggerDeviceScreenshot()
+        case .dragScreenshot: model?.triggerDragScreenshot()
+        case .deviceScreenRecord: model?.triggerDeviceScreenRecord()
+        case .dragScreenRecord: model?.triggerDragScreenRecord()
+        case .windowScreenshot: model?.triggerWindowScreenshot()
+        case .windowScreenRecord: model?.triggerWindowScreenRecord()
+        case .toggleRecording: model?.toggleRecordingShortcut()
+        }
+    }
+
+    @objc private func stopRecording() {
+        model?.toggleRecordingShortcut()
+    }
+
+    @objc private func newRecording() {
+        beginCapture(.recording)
+    }
+
+    @objc private func newScreenshot() {
+        beginCapture(.screenshot)
+    }
+
+    @objc private func toggleRecorderHUD() {
+        guard let model, let windowActions else { return }
+        guard model.canShowCaptureUI else {
+            return
+        }
+        if model.isHUDVisible {
+            model.hideHUD()
+            windowActions.dismiss("hud")
+        } else {
+            model.showHUD()
+            NSApp.unhide(nil)
+            windowActions.open("hud")
+        }
+    }
+
+    @objc private func showLastEditor() {
+        guard let model, let session = model.lastEditorSession, let windowActions else { return }
+        model.showEditor(for: session)
+        NSApp.unhide(nil)
+        windowActions.openEditorSession(session)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @objc func showSettings() {
+        windowActions?.showSettings()
+    }
+
+    @objc private func quit() {
+        NSApp.terminate(nil)
+    }
+
+    private func beginCapture(_ mode: CaptureMode) {
+        guard let model, let windowActions else { return }
+        guard model.canStartNewCapture else { return }
+        model.beginCapture(mode)
+        model.showHUD()
+        NSApp.unhide(nil)
+        windowActions.open("hud")
+    }
+}
+
+enum GlobalRecordingHotKeyRegistrationPolicy {
+    static func shouldRegister(
+        action: CaptureShortcutAction,
+        item: ShortcutItem,
+        captureState: CaptureState,
+        runtimeIsRecording: Bool,
+        shortcutRecorderIsActive: Bool
+    ) -> Bool {
+        guard item.isEnabled, !shortcutRecorderIsActive else { return false }
+        return true
+    }
+}
+
+@MainActor
+final class GlobalRecordingHotKeyController {
+    var registerHotKey: (KeyCombination, EventHotKeyID) -> (OSStatus, EventHotKeyRef?) = { combination, hotKeyID in
+        var ref: EventHotKeyRef?
+        let status = RegisterEventHotKey(combination.keyCode, combination.carbonModifiers, hotKeyID, GetApplicationEventTarget(), 0, &ref)
+        return (status, ref)
+    }
+    private weak var model: AppModel?
+    private var hotKeyRefs: [UInt32: EventHotKeyRef] = [:]
+    private var registeredCombinations: [UInt32: KeyCombination] = [:]
+    private var eventHandlerRef: EventHandlerRef?
+    private var cancellables: Set<AnyCancellable> = []
+
+    func detach() {
+        unregisterAll()
+        cancellables.removeAll()
+        model = nil
+    }
+
+    func attach(model: AppModel) {
+        if self.model === model {
+            syncRegistration(
+                captureState: model.captureState,
+                runtimeIsRecording: model.capture.isRecording,
+                shortcuts: model.shortcutPreferences,
+                shortcutRecorderIsActive: model.isShortcutRecorderActive
+            )
+            return
+        }
+
+        unregisterAll()
+        cancellables.removeAll()
+        self.model = model
+
+        model.$captureState
+            .sink { [weak self, weak model] state in
+                guard let model else { return }
+                self?.syncRegistration(
+                    captureState: state,
+                    runtimeIsRecording: model.capture.isRecording,
+                    shortcuts: model.shortcutPreferences,
+                    shortcutRecorderIsActive: model.isShortcutRecorderActive
+                )
+            }
+            .store(in: &cancellables)
+
+        model.capture.$isRecording
+            .sink { [weak self, weak model] isRecording in
+                guard let model else { return }
+                self?.syncRegistration(
+                    captureState: model.captureState,
+                    runtimeIsRecording: isRecording,
+                    shortcuts: model.shortcutPreferences,
+                    shortcutRecorderIsActive: model.isShortcutRecorderActive
+                )
+            }
+            .store(in: &cancellables)
+
+        model.$shortcutPreferences
+            .sink { [weak self, weak model] shortcuts in
+                guard let model else { return }
+                self?.syncRegistration(
+                    captureState: model.captureState,
+                    runtimeIsRecording: model.capture.isRecording,
+                    shortcuts: shortcuts,
+                    shortcutRecorderIsActive: model.isShortcutRecorderActive
+                )
+            }
+            .store(in: &cancellables)
+
+        model.$isShortcutRecorderActive
+            .sink { [weak self, weak model] isActive in
+                guard let model else { return }
+                self?.syncRegistration(
+                    captureState: model.captureState,
+                    runtimeIsRecording: model.capture.isRecording,
+                    shortcuts: model.shortcutPreferences,
+                    shortcutRecorderIsActive: isActive
+                )
+            }
+            .store(in: &cancellables)
+
+        model.$shortcutRegistrationRetryGeneration.dropFirst().sink { [weak self, weak model] _ in
+            guard let model else { return }
+            self?.syncRegistration(captureState: model.captureState, runtimeIsRecording: model.capture.isRecording, shortcuts: model.shortcutPreferences, shortcutRecorderIsActive: model.isShortcutRecorderActive)
+        }.store(in: &cancellables)
+
+        syncRegistration(
+            captureState: model.captureState,
+            runtimeIsRecording: model.capture.isRecording,
+            shortcuts: model.shortcutPreferences,
+            shortcutRecorderIsActive: model.isShortcutRecorderActive
+        )
+    }
+
+    private func syncRegistration(
+        captureState: CaptureState,
+        runtimeIsRecording: Bool,
+        shortcuts: ShortcutPreferences,
+        shortcutRecorderIsActive: Bool
+    ) {
+        guard installEventHandlerIfNeeded() else {
+            model?.syncShortcutRegistrationStates(Dictionary(uniqueKeysWithValues: CaptureShortcutAction.allCases.map {
+                ($0, shortcuts.item(for: $0).isEnabled ? .unavailable : .disabled)
+            }))
+            return
+        }
+
+        let actionMap: [(UInt32, CaptureShortcutAction)] = [
+            (1, .toggleRecording),
+            (2, .deviceScreenshot),
+            (3, .dragScreenshot),
+            (4, .deviceScreenRecord),
+            (5, .dragScreenRecord),
+            (6, .windowScreenshot),
+            (7, .windowScreenRecord)
+        ]
+
+        var states: [CaptureShortcutAction: CaptureShortcutRegistrationState] = [:]
+        for (id, action) in actionMap {
+            let item = shortcuts.item(for: action)
+            if GlobalRecordingHotKeyRegistrationPolicy.shouldRegister(
+                action: action,
+                item: item,
+                captureState: captureState,
+                runtimeIsRecording: runtimeIsRecording,
+                shortcutRecorderIsActive: shortcutRecorderIsActive
+            ) {
+                states[action] = registerIfNeeded(id: id, combination: item.keyCombination) ? .active : .unavailable
+            } else {
+                unregister(id: id)
+                states[action] = item.isEnabled ? .suspended : .disabled
+            }
+        }
+        model?.syncShortcutRegistrationStates(states)
+    }
+
+    private func registerIfNeeded(id: UInt32, combination: KeyCombination) -> Bool {
+        if let existing = registeredCombinations[id], existing == combination, hotKeyRefs[id] != nil {
+            return true
+        }
+
+        unregister(id: id)
+
+        let hotKeyID = EventHotKeyID(signature: fourCharCode("ORhk"), id: id)
+        let (status, ref) = registerHotKey(combination, hotKeyID)
+
+        if status == noErr, let ref {
+            hotKeyRefs[id] = ref
+            registeredCombinations[id] = combination
+            return true
+        }
+        return false
+    }
+
+    private func unregister(id: UInt32) {
+        if let ref = hotKeyRefs.removeValue(forKey: id) {
+            UnregisterEventHotKey(ref)
+        }
+        registeredCombinations.removeValue(forKey: id)
+    }
+
+    private func installEventHandlerIfNeeded() -> Bool {
+        guard eventHandlerRef == nil else { return true }
+
+        var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+        let callback: EventHandlerUPP = { _, eventRef, userData in
+            guard let userData, let eventRef else { return noErr }
+            var hotKeyID = EventHotKeyID()
+            let status = GetEventParameter(
+                eventRef,
+                EventParamName(kEventParamDirectObject),
+                EventParamType(typeEventHotKeyID),
+                nil,
+                MemoryLayout<EventHotKeyID>.size,
+                nil,
+                &hotKeyID
+            )
+            guard status == noErr else { return noErr }
+
+            let controller = Unmanaged<GlobalRecordingHotKeyController>
+                .fromOpaque(userData)
+                .takeUnretainedValue()
+            let targetID = hotKeyID.id
+            Task { @MainActor in
+                controller.handleHotKey(id: targetID)
+            }
+            return noErr
+        }
+
+        let status = InstallEventHandler(
+            GetApplicationEventTarget(),
+            callback,
+            1,
+            &eventType,
+            UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque()),
+            &eventHandlerRef
+        )
+
+        if status != noErr {
+            eventHandlerRef = nil
+        }
+
+        return status == noErr
+    }
+
+    private func handleHotKey(id: UInt32) {
+        guard let model, !model.isShortcutRecorderActive else { return }
+        switch id {
+        case 1:
+            model.toggleRecordingShortcut()
+        case 2:
+            model.triggerDeviceScreenshot()
+        case 3:
+            model.triggerDragScreenshot()
+        case 4:
+            model.triggerDeviceScreenRecord()
+        case 5:
+            model.triggerDragScreenRecord()
+        case 6:
+            model.triggerWindowScreenshot()
+        case 7:
+            model.triggerWindowScreenRecord()
+        default:
+            break
+        }
+    }
+
+    private func unregisterAll() {
+        for (_, ref) in hotKeyRefs {
+            UnregisterEventHotKey(ref)
+        }
+        hotKeyRefs.removeAll()
+        registeredCombinations.removeAll()
+
+        if let eventHandlerRef {
+            RemoveEventHandler(eventHandlerRef)
+            self.eventHandlerRef = nil
+        }
+    }
+
+    private func fourCharCode(_ string: String) -> OSType {
+        string.utf8.reduce(0) { result, character in
+            (result << 8) + OSType(character)
+        }
+    }
+}
+
+private enum OpenRecorderMenuBarIcon {
+    static var image: NSImage {
+        let image = resourceURL
+            .flatMap(NSImage.init(contentsOf:)) ??
+            NSImage(systemSymbolName: "record.circle", accessibilityDescription: "Open Recorder") ??
+            NSImage(size: NSSize(width: 18, height: 18))
+        image.size = NSSize(width: 18, height: 18)
+        image.isTemplate = true
+        return image
+    }
+
+    private static var resourceURL: URL? {
+        OpenRecorderResources.url(forResource: "OpenRecorderMenuBarIcon", withExtension: "png")
+    }
+}

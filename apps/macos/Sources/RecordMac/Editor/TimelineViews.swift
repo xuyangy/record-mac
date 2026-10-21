@@ -1,0 +1,2012 @@
+import AVFoundation
+import AppKit
+import Charts
+import CoreGraphics
+import SwiftUI
+import UniformTypeIdentifiers
+
+enum TimelineMetrics {
+    static let panelPadding: CGFloat = 12
+    static let trackTopPadding: CGFloat = 8
+    static let toolbarControlHeight: CGFloat = 34
+    static let rulerHeight: CGFloat = 24
+    static let clipHeight: CGFloat = 73.5
+    static let layerHeight: CGFloat = 59.5
+    static let regionItemHeight: CGFloat = 42
+    static let playheadWidth: CGFloat = 1.5
+    static let compactPanelHeight: CGFloat = toolbarControlHeight
+        + panelPadding * 2
+        + 1
+        + trackTopPadding
+        + rulerHeight
+        + clipHeight
+        + layerHeight
+        + layerHeight
+}
+
+struct TimelinePanel: View {
+    @EnvironmentObject private var model: AppModel
+    var videoURL: URL?
+    var playback: VideoPlaybackController
+    var edits: TimelineEditDriver
+    var hasRecordedCamera: Bool
+    var defaultCameraSettings: FacecamSettings?
+    @State private var timelineViewport = TimelineViewport(duration: 0)
+    @State private var isDraggingTimelineZoom = false
+    @State private var sourceFramesPerSecond = TimelineSourceFrameRate.fallback
+    @FocusState private var isTimelineFocused: Bool
+
+    private var editPlan: TimelineExportEditPlan {
+        TimelineExportEditPlan.build(duration: playback.duration, edits: edits.snapshot)
+    }
+    private func outputTime(_ sourceTime: Double) -> Double {
+        editPlan.timelineTime(forSourceTime: sourceTime)
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            timelineToolbar
+
+            ZStack(alignment: .top) {
+                Button {
+                    edits.clearSelection()
+                    isTimelineFocused = true
+                } label: {
+                    Color.clear
+                        .rectangularHitTarget()
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Clear timeline selection")
+                .accessibilityHint("Clears the selected timeline item.")
+
+                TimelineTrackContent(
+                    videoURL: videoURL,
+                    playback: playback,
+                    edits: edits,
+                    hasRecordedCamera: hasRecordedCamera,
+                    defaultCameraSettings: defaultCameraSettings,
+                    sourceFramesPerSecond: sourceFramesPerSecond,
+                    viewport: $timelineViewport
+                )
+                    .padding(.horizontal, TimelineMetrics.panelPadding)
+                    .padding(.top, TimelineMetrics.trackTopPadding)
+            }
+        }
+        .studioEditorPaneChrome(bg: Theme.timelineBg)
+        .focusable()
+        .focused($isTimelineFocused)
+        .focusEffectDisabled()
+        .onKeyPress { press in
+            if press.key == .delete || press.key == .deleteForward {
+                deleteTimelineSelection()
+                return .handled
+            }
+
+            switch press.characters.lowercased() {
+            case "z": edits.add(.zoom, at: playback.currentTime, duration: playback.duration); return .handled
+            case "s": edits.cycleClipSpeed(at: playback.currentTime, duration: playback.duration); return .handled
+            case "t": edits.addClipSplit(at: playback.currentTime, duration: playback.duration); return .handled
+            case "c": edits.splitCameraClip(at: playback.currentTime, duration: playback.duration, fallback: defaultCameraSettings); return .handled
+            default: return .ignored
+            }
+        }
+        .onDeleteCommand {
+            deleteTimelineSelection()
+        }
+        .onAppear {
+            syncTimelineViewportDuration(editPlan.outputDuration)
+            ensureCameraLayer()
+        }
+        .onChange(of: playback.duration) { _, newDuration in
+            syncTimelineViewportDuration(editPlan.outputDuration)
+            ensureCameraLayer()
+        }
+        .onChange(of: editPlan) { _, plan in
+            syncTimelineViewportDuration(plan.outputDuration)
+        }
+        .onChange(of: hasRecordedCamera) { _, _ in
+            ensureCameraLayer()
+        }
+        .onChange(of: defaultCameraSettings) { _, _ in
+            ensureCameraLayer()
+        }
+        .onChange(of: playback.currentTime) { _, newTime in
+            updateTimelineViewport(for: newTime)
+        }
+        .onChange(of: playback.isPlaying) { _, isPlaying in
+            guard isPlaying else { return }
+            timelineViewport = timelineViewport.following(time: outputTime(playback.currentTime))
+        }
+        .onChange(of: edits.state.hasSelection) { _, hasSelection in
+            guard hasSelection else { return }
+            isTimelineFocused = true
+        }
+    }
+
+    private var timelineToolbar: some View {
+        ZStack {
+            HStack(spacing: 8) {
+                TimelineTimeDisplay(currentTime: outputTime(playback.currentTime), duration: editPlan.outputDuration)
+
+                if hasRecordedCamera {
+                    Menu {
+                        Button("Start New Camera Segment Here") {
+                            playback.pause()
+                            edits.splitCameraClip(at: playback.currentTime, duration: playback.duration, fallback: defaultCameraSettings)
+                        }
+                        Divider()
+                        ForEach(CameraLayout.allCases) { layout in
+                            Button(layout.title) {
+                                playback.pause()
+                                edits.setCameraLayout(layout, at: playback.currentTime,
+                                    duration: playback.duration, fallback: defaultCameraSettings)
+                            }
+                        }
+                    } label: {
+                        Image(systemName: "rectangle.split.2x1")
+                    }
+                    .menuStyle(.borderlessButton)
+                    .fixedSize()
+                    .disabled(playback.duration <= 0 || playback.currentTime >= playback.duration)
+                    .accessibilityLabel("Camera layout at playhead")
+                    .help("Change camera layout from the playhead. Earlier camera settings are kept.")
+                }
+
+                Spacer()
+
+                TimelineEditToolButton(
+                    symbolName: "scissors",
+                    title: "Split at playhead",
+                    isEnabled: playback.player != nil && playback.duration > 0
+                ) {
+                    edits.addClipSplit(at: playback.currentTime, duration: playback.duration)
+                }
+
+                TimelineEditToolButton(
+                    symbolName: "sparkles", title: edits.isGeneratingAutoZooms ? "Generating zooms…" : "Regenerate automatic zooms",
+                    isEnabled: videoURL != nil && playback.duration > 0 && !edits.isGeneratingAutoZooms
+                ) {
+                    edits.autoZoomCameraSettings = defaultCameraSettings
+                    edits.autoZoomMaximumDepth = model.appShell.settings.state.autoZoomMaximumDepth
+                    edits.regenerateAutoZooms(from: videoURL, duration: playback.duration, preset: model.autoZoomAnimationPreset)
+                }
+
+                TimelinePreviewSpeedPicker(playback: playback)
+
+                TimelineZoomSlider(
+                    viewport: $timelineViewport,
+                    duration: editPlan.outputDuration,
+                    currentTime: outputTime(playback.currentTime),
+                    isDragging: $isDraggingTimelineZoom
+                )
+            }
+
+            TimelineTransportControls(
+                playback: playback,
+                framesPerSecond: sourceFramesPerSecond
+            )
+        }
+        .padding(TimelineMetrics.panelPadding)
+        .zIndex(1)
+        .task(id: videoURL) {
+            let loadedFrameRate = await TimelineSourceFrameRate.load(from: videoURL)
+            guard !Task.isCancelled else { return }
+            sourceFramesPerSecond = loadedFrameRate
+            playback.sourceFramesPerSecond = loadedFrameRate
+        }
+    }
+
+    private func syncTimelineViewportDuration(_ duration: Double) {
+        timelineViewport = TimelineViewport.reconciled(
+            duration: duration,
+            previous: timelineViewport,
+            currentTime: outputTime(playback.currentTime)
+        )
+    }
+
+    private func updateTimelineViewport(for sourceTime: Double) {
+        let currentTime = outputTime(sourceTime)
+        if playback.isPlaying {
+            timelineViewport = timelineViewport.following(time: currentTime)
+        } else if !timelineViewport.contains(currentTime) {
+            timelineViewport = timelineViewport.keepingVisible(time: currentTime)
+        }
+    }
+
+    private func ensureCameraLayer() {
+        guard hasRecordedCamera else { return }
+        edits.ensureCameraClips(duration: playback.duration, fallback: defaultCameraSettings)
+    }
+
+    private func deleteTimelineSelection() {
+        edits.deleteSelection(duration: playback.duration)
+    }
+}
+
+struct TimelineTrackContent: View {
+    var videoURL: URL?
+    var playback: VideoPlaybackController
+    var edits: TimelineEditDriver
+    var hasRecordedCamera: Bool
+    var defaultCameraSettings: FacecamSettings?
+    var sourceFramesPerSecond: Double
+    @Binding var viewport: TimelineViewport
+    @State private var timelineSize = CGSize.zero
+    @State private var hoverTime: Double?
+
+    private var sourceViewport: TimelineViewport {
+        var result = viewport
+        result.editPlan = TimelineExportEditPlan.build(duration: playback.duration, edits: edits.snapshot)
+        return result
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            TimelineRuler(viewport: viewport, onSeek: { time in
+                playback.seek(to: sourceViewport.editPlan?.sourceTime(forOutputTime: time) ?? time)
+            }, onScrubbingChanged: playback.setScrubbing)
+                .rectangularHitTarget()
+            TimelineClipRow(videoURL: videoURL, duration: playback.duration, currentTime: playback.currentTime, viewport: sourceViewport, splitTimes: edits.clipSplitTimes, trimRegions: edits.trimRegions, clipSpeeds: edits.clipSpeeds, selectedClipIndex: edits.selectedClipIndex, seek: playback.seek(to:), onScrubbingChanged: playback.setScrubbing, edits: edits)
+            TimelineLayerRow(kind: .zoom, duration: playback.duration, viewport: sourceViewport, regions: edits.zoomRegions.map(TimelineRegionRenderData.zoom), selectedID: edits.selectedKind == .zoom ? edits.selectedID : nil, edits: edits)
+            TimelineCameraLayerRow(
+                duration: playback.duration,
+                currentTime: playback.currentTime,
+                viewport: sourceViewport,
+                hasRecordedCamera: hasRecordedCamera,
+                fallbackSettings: defaultCameraSettings,
+                cameraClips: edits.resolvedCameraClips(duration: playback.duration, fallback: defaultCameraSettings),
+                selectedID: edits.selectedCameraClipID,
+                edits: edits
+            )
+        }
+        .overlay(alignment: .topLeading) {
+            ZStack(alignment: .topLeading) {
+                TimelinePlayhead(viewport: sourceViewport, currentTime: playback.currentTime, onSeek: playback.seek(to:), onScrubbingChanged: playback.setScrubbing)
+                if let hoverTime {
+                    TimelineHoverIndicator(
+                        viewport: sourceViewport,
+                        time: hoverTime,
+                        framesPerSecond: sourceFramesPerSecond
+                    )
+                }
+            }
+        }
+        .readSize { timelineSize = $0 }
+        .rectangularHitTarget()
+        .coordinateSpace(name: "TimelineTrackCoordinateSpace")
+        .onContinuousHover(coordinateSpace: .local) { phase in
+            switch phase {
+            case .active(let location):
+                let pointedTime = TimelineHoverPreview.time(
+                    videoIsAvailable: videoURL != nil,
+                    playbackIsActive: playback.isPlaying,
+                    x: location.x,
+                    viewport: sourceViewport,
+                    width: timelineSize.width
+                )
+                hoverTime = pointedTime.map {
+                    TimelineFrameStepper.frameAlignedTime(
+                        $0,
+                        framesPerSecond: sourceFramesPerSecond,
+                        duration: playback.duration
+                    )
+                }
+            case .ended:
+                hoverTime = nil
+            }
+        }
+        .onChange(of: playback.isPlaying) { _, isPlaying in
+            if isPlaying {
+                hoverTime = nil
+            }
+        }
+    }
+}
+
+
+private struct TimelineTransportControls: View {
+    var playback: VideoPlaybackController
+    var framesPerSecond: Double
+
+    var body: some View {
+        HStack(spacing: 10) {
+            TimelineToolbarIconButton(symbolName: "backward.end.fill", title: "Jump to start", isEnabled: isEnabled) {
+                playback.seek(to: 0)
+            }
+            TimelineToolbarIconButton(symbolName: "gobackward.10", title: "Back 10 frames", isEnabled: isEnabled) {
+                stepFrames(-10)
+            }
+            TimelinePlayPauseButton(playback: playback)
+            TimelineToolbarIconButton(symbolName: "goforward.10", title: "Forward 10 frames", isEnabled: isEnabled) {
+                stepFrames(10)
+            }
+            TimelineToolbarIconButton(symbolName: "forward.end.fill", title: "Jump to end", isEnabled: isEnabled) {
+                playback.seek(to: playback.duration)
+            }
+        }
+    }
+
+    private var isEnabled: Bool {
+        playback.player != nil
+    }
+
+    private func stepFrames(_ frameCount: Int) {
+        let target = TimelineFrameStepper.targetTime(
+            currentTime: playback.currentTime,
+            frameCount: frameCount,
+            framesPerSecond: framesPerSecond,
+            duration: playback.duration
+        )
+        playback.seek(to: target)
+    }
+}
+
+private struct TimelinePlayPauseButton: View {
+    var playback: VideoPlaybackController
+    @State private var isHovering = false
+
+    var body: some View {
+        let title = playback.isPlaying ? "Pause" : "Play"
+        Button {
+            playback.togglePlayback()
+        } label: {
+            Image(systemName: playback.isPlaying ? "pause.fill" : "play.fill")
+                .font(.system(size: 14, weight: .bold))
+                .foregroundStyle(playback.isPlaying || isHovering ? Color.white : Theme.fgMuted)
+                .frame(width: 28, height: 28)
+                .offset(x: playback.isPlaying ? 0 : 1)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(playback.player == nil)
+        .opacity(playback.player == nil ? 0.35 : 1)
+        .help(title)
+        .accessibilityLabel(title)
+        .onHover { hovering in
+            isHovering = hovering
+        }
+    }
+}
+
+private struct TimelineToolbarIconButton: View {
+    var symbolName: String
+    var title: String
+    var isEnabled = true
+    var action: () -> Void
+    @State private var isHovering = false
+
+    var body: some View {
+        StudioButton(hitTarget: .rounded(6), action: action) {
+            Image(systemName: symbolName)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(
+                    isEnabled
+                        ? (isHovering ? Color.white : Theme.fgMuted)
+                        : Theme.fgDisabled
+                )
+                .frame(width: 28, height: 28)
+                .contentShape(Rectangle())
+        }
+        .disabled(!isEnabled)
+        .accessibilityLabel(title)
+        .onHover { hovering in
+            isHovering = hovering
+        }
+    }
+}
+
+private struct TimelineEditToolButton: View {
+    var symbolName: String
+    var title: String
+    var isEnabled = true
+    var action: () -> Void
+
+    var body: some View {
+        TimelineToolbarIconButton(symbolName: symbolName, title: title, isEnabled: isEnabled, action: action)
+    }
+}
+
+private struct TimelineTimeDisplay: View {
+    var currentTime: Double
+    var duration: Double
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Text(formatPlaybackTime(currentTime))
+                .foregroundStyle(Color.white)
+            Text("/")
+                .foregroundStyle(Theme.fgSubtle.opacity(0.60))
+            Text(formatPlaybackTime(duration))
+                .foregroundStyle(Theme.fgMuted)
+        }
+        .font(.system(size: 11.5, weight: .semibold, design: .monospaced))
+        .monospacedDigit()
+        .padding(.horizontal, 4)
+        .accessibilityLabel("Playback time \(formatPlaybackTime(currentTime)) of \(formatPlaybackTime(duration))")
+    }
+}
+
+private struct TimelinePreviewSpeedPicker: View {
+    var playback: VideoPlaybackController
+
+    var body: some View {
+        Picker("Preview speed", selection: speedBinding) {
+            ForEach(VideoPlaybackDriver.previewPlaybackSpeeds, id: \.self) { speed in
+                Text(PreviewPlaybackSpeedSelection.label(for: speed))
+                    .tag(speed)
+            }
+        }
+        .labelsHidden()
+        .pickerStyle(.menu)
+        .controlSize(.small)
+        .frame(width: 64)
+        .disabled(!isEnabled)
+        .opacity(isEnabled ? 1 : 0.5)
+        .accessibilityLabel("Preview playback speed \(playback.previewPlaybackSpeedLabel())")
+        .help("Preview playback speed")
+    }
+
+    private var isEnabled: Bool {
+        playback.player != nil
+    }
+
+    private var speedBinding: Binding<Double> {
+        Binding(
+            get: { playback.previewPlaybackSpeed },
+            set: { requestedSpeed in
+                PreviewPlaybackSpeedSelection.apply(requestedSpeed, to: playback)
+            }
+        )
+    }
+}
+
+private struct TimelineZoomSlider: View {
+    @Binding var viewport: TimelineViewport
+    var duration: Double
+    var currentTime: Double
+    @Binding var isDragging: Bool
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(Theme.fgSubtle)
+
+            ElasticSlider(
+                value: sliderValue,
+                range: 0...1,
+                step: 0.01,
+                valueText: zoomPercentageText,
+                onEditingChanged: { editing in
+                    withAnimation(.easeOut(duration: 0.12)) {
+                        isDragging = editing
+                    }
+                },
+                trackHeight: 20,
+                hitHeight: 20,
+                fillColor: Color.white.opacity(0.20),
+                thumbSize: 14,
+                showStepDots: false,
+                showTooltip: false,
+                setsValueFromPointerLocation: true
+            )
+            .frame(width: 85)
+
+            Text(zoomPercentageText)
+                .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
+                .foregroundStyle(Theme.fgMuted)
+                .frame(width: 36, alignment: .trailing)
+        }
+        .disabled(!isEnabled)
+        .opacity(isEnabled ? 1 : 0.45)
+        .accessibilityLabel("Timeline zoom \(zoomPercentageText)")
+        .help("Timeline zoom percentage")
+    }
+
+    private var sliderValue: Binding<Double> {
+        Binding(
+            get: {
+                TimelineViewport.sliderValue(forVisibleDuration: viewport.visibleDuration, duration: duration)
+            },
+            set: { value in
+                let visibleDuration = TimelineViewport.visibleDuration(forSliderValue: value, duration: duration)
+                viewport = TimelineViewport(
+                    duration: duration,
+                    visibleStart: viewport.visibleStart,
+                    visibleDuration: viewport.visibleDuration
+                )
+                .withVisibleDuration(visibleDuration, centeredOn: currentTime)
+            }
+        )
+    }
+
+    private var isEnabled: Bool {
+        TimelineViewport.isZoomEnabled(duration: duration)
+    }
+
+    private var zoomPercentageText: String {
+        guard duration > 0, viewport.visibleDuration > 0 else { return "100%" }
+        let zoomRatio = duration / max(viewport.visibleDuration, TimelineViewport.minimumVisibleDuration)
+        let percent = max(100, Int((zoomRatio * 100).rounded()))
+        return "\(percent)%"
+    }
+}
+
+struct TimelineViewport: Equatable {
+    static let minimumVisibleDuration = 2.0
+
+    var editPlan: TimelineExportEditPlan?
+    var duration: Double
+    var visibleStart: Double
+    var visibleDuration: Double
+
+    var visibleEnd: Double { min(duration, visibleStart + visibleDuration) }
+    var isZoomEnabled: Bool { Self.isZoomEnabled(duration: duration) }
+    var isFullDuration: Bool {
+        duration <= 0 || abs(visibleDuration - duration) < 0.001
+    }
+
+    init(duration: Double, visibleStart: Double = 0, visibleDuration: Double? = nil) {
+        let safeDuration = Self.safeDuration(duration)
+        self.duration = safeDuration
+
+        let requestedVisibleDuration = visibleDuration ?? safeDuration
+        self.visibleDuration = Self.clampedVisibleDuration(requestedVisibleDuration, duration: safeDuration)
+        self.visibleStart = Self.clampedStart(visibleStart, duration: safeDuration, visibleDuration: self.visibleDuration)
+    }
+
+    static func full(duration: Double) -> TimelineViewport {
+        TimelineViewport(duration: duration)
+    }
+
+    static func isZoomEnabled(duration: Double) -> Bool {
+        safeDuration(duration) > minimumVisibleDuration
+    }
+
+    static func reconciled(duration newDuration: Double, previous: TimelineViewport?, currentTime: Double) -> TimelineViewport {
+        let safeDuration = safeDuration(newDuration)
+        guard safeDuration > 0 else {
+            return TimelineViewport(duration: 0)
+        }
+
+        guard isZoomEnabled(duration: safeDuration), let previous, !previous.isFullDuration else {
+            return TimelineViewport.full(duration: safeDuration)
+        }
+
+        let visibleDuration = clampedVisibleDuration(previous.visibleDuration, duration: safeDuration)
+        return TimelineViewport(
+            duration: safeDuration,
+            visibleStart: previous.visibleStart,
+            visibleDuration: visibleDuration
+        )
+        .keepingVisible(time: currentTime)
+    }
+
+    func withVisibleDuration(_ requestedVisibleDuration: Double, centeredOn time: Double) -> TimelineViewport {
+        guard isZoomEnabled else {
+            return .full(duration: duration)
+        }
+
+        let nextVisibleDuration = Self.clampedVisibleDuration(requestedVisibleDuration, duration: duration)
+        let anchor = Self.clamp(time.isFinite ? time : visibleStart + visibleDuration / 2, lower: 0, upper: duration)
+        return TimelineViewport(
+            duration: duration,
+            visibleStart: anchor - nextVisibleDuration / 2,
+            visibleDuration: nextVisibleDuration
+        )
+    }
+
+    func following(time: Double) -> TimelineViewport {
+        keepingVisible(time: time)
+    }
+
+    func keepingVisible(time: Double) -> TimelineViewport {
+        guard isZoomEnabled, !isFullDuration, time.isFinite else {
+            return self
+        }
+
+        if time < visibleStart {
+            return TimelineViewport(duration: duration, visibleStart: time, visibleDuration: visibleDuration)
+        }
+        if time > visibleEnd {
+            return TimelineViewport(duration: duration, visibleStart: time - visibleDuration, visibleDuration: visibleDuration)
+        }
+
+        return self
+    }
+
+    func contains(_ time: Double) -> Bool {
+        let time = editPlan?.timelineTime(forSourceTime: time) ?? time
+        return time.isFinite && time >= visibleStart - 0.001 && time <= visibleEnd + 0.001
+    }
+
+    func intersects(_ span: TimelineSpan) -> Bool {
+        let start = editPlan?.timelineTime(forSourceTime: span.start) ?? span.start
+        let end = editPlan?.timelineTime(forSourceTime: span.end) ?? span.end
+        return end - start > 0.001 && end > visibleStart + 0.001 && start < visibleEnd - 0.001
+    }
+
+    func time(forX x: CGFloat, width: CGFloat) -> Double? {
+        guard visibleDuration > 0, width.isFinite, width > 0, x.isFinite else { return nil }
+        let clampedX = min(max(x, 0), width)
+        let time = visibleStart + Double(clampedX / width) * visibleDuration
+        let clamped = Self.clamp(time, lower: 0, upper: duration)
+        return editPlan?.sourceTime(forOutputTime: clamped) ?? clamped
+    }
+
+    func x(for time: Double, width: CGFloat, clamped: Bool = false) -> CGFloat? {
+        guard visibleDuration > 0, width.isFinite, width > 0, time.isFinite else { return nil }
+        let mappedTime = editPlan?.timelineTime(forSourceTime: time) ?? time
+        let rawFraction = (mappedTime - visibleStart) / visibleDuration
+        let fraction = clamped ? Self.clamp(rawFraction, lower: 0, upper: 1) : rawFraction
+        return width * CGFloat(fraction)
+    }
+
+    static func visibleDuration(forSliderValue sliderValue: Double, duration: Double) -> Double {
+        let safeDuration = safeDuration(duration)
+        guard isZoomEnabled(duration: safeDuration) else { return safeDuration }
+        let progress = clamp(sliderValue, lower: 0, upper: 1)
+        return safeDuration - progress * (safeDuration - minimumVisibleDuration)
+    }
+
+    static func sliderValue(forVisibleDuration visibleDuration: Double, duration: Double) -> Double {
+        let safeDuration = safeDuration(duration)
+        guard isZoomEnabled(duration: safeDuration), safeDuration > minimumVisibleDuration else { return 0 }
+        let safeVisibleDuration = clampedVisibleDuration(visibleDuration, duration: safeDuration)
+        return clamp((safeDuration - safeVisibleDuration) / (safeDuration - minimumVisibleDuration), lower: 0, upper: 1)
+    }
+
+    private static func safeDuration(_ duration: Double) -> Double {
+        duration.isFinite && duration > 0 ? duration : 0
+    }
+
+    private static func clampedVisibleDuration(_ visibleDuration: Double, duration: Double) -> Double {
+        let safeDuration = safeDuration(duration)
+        guard safeDuration > minimumVisibleDuration else {
+            return safeDuration
+        }
+
+        let requested = visibleDuration.isFinite && visibleDuration > 0 ? visibleDuration : safeDuration
+        return clamp(requested, lower: minimumVisibleDuration, upper: safeDuration)
+    }
+
+    private static func clampedStart(_ start: Double, duration: Double, visibleDuration: Double) -> Double {
+        let safeStart = start.isFinite ? start : 0
+        return clamp(safeStart, lower: 0, upper: max(0, duration - visibleDuration))
+    }
+
+    private static func clamp(_ value: Double, lower: Double, upper: Double) -> Double {
+        min(max(value, lower), upper)
+    }
+}
+
+struct TimelineRuler: View {
+    var viewport: TimelineViewport
+    var onSeek: ((Double) -> Void)? = nil
+    var onScrubbingChanged: ((Bool) -> Void)? = nil
+
+    var body: some View {
+        GeometryReader { proxy in
+            ZStack(alignment: .topLeading) {
+                if shouldShowHalfSecondTicks(width: proxy.size.width) {
+                    ForEach(TimelineRulerTickBuilder.halfSecondTicks(visibleStart: viewport.visibleStart, visibleDuration: displayDuration, totalDuration: viewport.duration)) { tick in
+                        let x = tickPosition(for: tick.time, width: proxy.size.width)
+                        Rectangle()
+                            .fill(Color.secondary.opacity(0.16))
+                            .frame(width: 1, height: 3)
+                            .position(x: x, y: 3)
+                    }
+                }
+
+                ForEach(TimelineRulerTickBuilder.ticks(visibleStart: viewport.visibleStart, visibleDuration: displayDuration, totalDuration: viewport.duration)) { tick in
+                    let x = tickPosition(for: tick.time, width: proxy.size.width)
+                    Rectangle().fill(Theme.border).frame(width: 1, height: 6).position(x: x, y: 4)
+                    if !tick.label.isEmpty {
+                        Text(tick.label)
+                            .font(.system(size: 9, weight: .medium, design: .monospaced))
+                            .foregroundStyle(Color.secondary.opacity(0.72))
+                            .frame(width: 44)
+                            .position(x: labelPosition(for: x, width: proxy.size.width), y: 11)
+                    }
+                }
+            }
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0, coordinateSpace: .local)
+                    .onChanged { value in
+                        onScrubbingChanged?(true)
+                        if let time = viewport.time(forX: value.location.x, width: proxy.size.width) {
+                            onSeek?(time)
+                        }
+                    }
+                    .onEnded { _ in onScrubbingChanged?(false) }
+            )
+        }
+        .frame(height: TimelineMetrics.rulerHeight)
+    }
+
+    private func tickPosition(for time: Double, width: CGFloat) -> CGFloat { viewport.x(for: time, width: width, clamped: true) ?? 0 }
+    private func labelPosition(for x: CGFloat, width: CGFloat) -> CGFloat { min(max(x, 22), max(22, width - 22)) }
+    private func shouldShowHalfSecondTicks(width: CGFloat) -> Bool {
+        guard width.isFinite, width > 0, displayDuration.isFinite, displayDuration > 0 else { return false }
+        return width / CGFloat(displayDuration * 2) >= 4
+    }
+    private var displayDuration: Double { viewport.visibleDuration > 0 ? viewport.visibleDuration : 6 }
+}
+
+struct TimelinePlayhead: View {
+    var viewport: TimelineViewport
+    var currentTime: Double
+    var onSeek: ((Double) -> Void)? = nil
+    var onScrubbingChanged: ((Bool) -> Void)? = nil
+
+    @State private var isDragging = false
+
+    var body: some View {
+        GeometryReader { proxy in
+            let x = viewport.x(for: currentTime, width: proxy.size.width, clamped: true) ?? 0
+            ZStack(alignment: .topLeading) {
+                // Playhead line
+                Rectangle()
+                    .fill(Color.white)
+                    .frame(width: 1.5, height: proxy.size.height)
+                    .offset(x: x - 0.75)
+
+                // White Playhead Pin Knob with generous touch target
+                ZStack {
+                    Circle()
+                        .fill(Color.white)
+                        .frame(width: 11, height: 11)
+                        .overlay {
+                            Circle()
+                                .strokeBorder(Color.black.opacity(0.25), lineWidth: 0.8)
+                        }
+                        .shadow(color: Color.black.opacity(0.45), radius: 4, y: 1.5)
+                        .scaleEffect(isDragging ? 1.3 : 1.0)
+                        .animation(.spring(response: 0.2, dampingFraction: 0.7), value: isDragging)
+                }
+                .frame(width: 28, height: 28)
+                .contentShape(Rectangle())
+                .position(x: x, y: 9)
+                .gesture(
+                    DragGesture(minimumDistance: 0, coordinateSpace: .named("TimelineTrackCoordinateSpace"))
+                        .onChanged { value in
+                            onScrubbingChanged?(true)
+                            isDragging = true
+                            if let time = viewport.time(forX: value.location.x, width: proxy.size.width) {
+                                onSeek?(time)
+                            }
+                        }
+                        .onEnded { _ in
+                            onScrubbingChanged?(false)
+                            isDragging = false
+                        }
+                )
+            }
+        }
+    }
+}
+
+struct TimelineHoverIndicator: View {
+    var viewport: TimelineViewport
+    var time: Double
+    var framesPerSecond: Double = TimelineSourceFrameRate.fallback
+
+    var body: some View {
+        GeometryReader { proxy in
+            let x = viewport.x(for: time, width: proxy.size.width, clamped: true) ?? 0
+
+            ZStack(alignment: .topLeading) {
+                Rectangle()
+                    .fill(Color.white.opacity(0.38))
+                    .frame(width: 1, height: proxy.size.height)
+                    .offset(x: x - 0.5)
+
+                Text("\(formatPlaybackTime(time)) · f\(frameWithinSecond)")
+                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(Theme.fg.opacity(0.92))
+                    .padding(.horizontal, 5)
+                    .frame(height: 18)
+                    .background(Theme.surfaceRaised.opacity(0.94), in: Rectangle())
+                    .position(x: min(max(x, 28), max(28, proxy.size.width - 28)), y: 9)
+            }
+        }
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+
+    private var frameWithinSecond: Int {
+        let fps = TimelineSourceFrameRate.normalized(framesPerSecond)
+        let frame = Int(floor(max(0, time) * fps + 0.001))
+        return frame % max(1, Int(fps.rounded()))
+    }
+}
+
+enum TimelineHoverPreview {
+    static func time(
+        videoIsAvailable: Bool,
+        playbackIsActive: Bool,
+        x: CGFloat,
+        viewport: TimelineViewport,
+        width: CGFloat
+    ) -> Double? {
+        guard videoIsAvailable, !playbackIsActive else { return nil }
+        return TimelineSeekMapper.time(forX: x, viewport: viewport, width: width)
+    }
+}
+
+enum TimelineSeekMapper {
+    static func time(forX x: CGFloat, duration: Double, width: CGFloat) -> Double? {
+        guard duration.isFinite, duration > 0, width.isFinite, width > 0, x.isFinite else { return nil }
+        return duration * Double(min(max(x / width, 0), 1))
+    }
+
+    static func time(forX x: CGFloat, viewport: TimelineViewport, width: CGFloat) -> Double? {
+        viewport.time(forX: x, width: width)
+    }
+
+    static func x(forTime time: Double, viewport: TimelineViewport, width: CGFloat, clamped: Bool = false) -> CGFloat? {
+        viewport.x(for: time, width: width, clamped: clamped)
+    }
+}
+
+enum TimelineSourceFrameRate {
+    static let fallback = 30.0
+    static let supportedRange = 1.0...240.0
+
+    static func normalized(_ framesPerSecond: Double) -> Double {
+        guard framesPerSecond.isFinite,
+              supportedRange.contains(framesPerSecond) else {
+            return fallback
+        }
+        return framesPerSecond
+    }
+
+    static func load(from videoURL: URL?) async -> Double {
+        guard let videoURL else { return fallback }
+
+        do {
+            let asset = AVURLAsset(url: videoURL)
+            guard let videoTrack = try await asset.loadTracks(withMediaType: .video).first else {
+                return fallback
+            }
+            try Task.checkCancellation()
+            let nominalFrameRate = try await videoTrack.load(.nominalFrameRate)
+            return normalized(Double(nominalFrameRate))
+        } catch {
+            return fallback
+        }
+    }
+}
+
+enum TimelineFrameStepper {
+    static func frameAlignedTime(
+        _ seconds: Double,
+        framesPerSecond: Double,
+        duration: Double
+    ) -> Double {
+        let safeSeconds = seconds.isFinite ? max(0, seconds) : 0
+        let fps = TimelineSourceFrameRate.normalized(framesPerSecond)
+        let aligned = floor(safeSeconds * fps) / fps
+        return duration.isFinite && duration > 0 ? min(aligned, duration) : aligned
+    }
+
+    static func targetTime(
+        currentTime: Double,
+        frameCount: Int,
+        framesPerSecond: Double,
+        duration: Double
+    ) -> Double {
+        let safeFramesPerSecond = TimelineSourceFrameRate.normalized(framesPerSecond)
+        let safeCurrentTime = currentTime.isFinite ? max(0, currentTime) : 0
+        let safeDuration = duration.isFinite ? max(0, duration) : 0
+        let requestedTime = safeCurrentTime + Double(frameCount) / safeFramesPerSecond
+        return min(max(0, requestedTime), safeDuration)
+    }
+}
+
+enum PreviewPlaybackSpeedSelection {
+    static func label(for speed: Double) -> String {
+        guard speed.isFinite, speed > 0 else { return "1x" }
+        if speed.rounded() == speed {
+            return "\(Int(speed))x"
+        }
+        return "\(speed.formatted(.number.precision(.fractionLength(0...2))))x"
+    }
+
+    static func cycleCount(
+        from currentSpeed: Double,
+        to requestedSpeed: Double,
+        availableSpeeds: [Double] = VideoPlaybackDriver.previewPlaybackSpeeds
+    ) -> Int {
+        guard !availableSpeeds.isEmpty,
+              let targetIndex = availableSpeeds.firstIndex(where: { approximatelyEqual($0, requestedSpeed) }) else {
+            return 0
+        }
+
+        let currentIndex = availableSpeeds.enumerated().min { left, right in
+            abs(left.element - currentSpeed) < abs(right.element - currentSpeed)
+        }?.offset ?? 0
+
+        return (targetIndex - currentIndex + availableSpeeds.count) % availableSpeeds.count
+    }
+
+    @MainActor
+    static func apply(_ requestedSpeed: Double, to playback: VideoPlaybackController) {
+        let count = cycleCount(
+            from: playback.previewPlaybackSpeed,
+            to: requestedSpeed
+        )
+        for _ in 0..<count {
+            playback.cyclePreviewPlaybackSpeed()
+        }
+    }
+
+    private static func approximatelyEqual(_ lhs: Double, _ rhs: Double) -> Bool {
+        abs(lhs - rhs) < 0.000_001
+    }
+}
+
+struct ClipWaveformTextureView: View {
+    var body: some View {
+        TimelineWaveformPreview(samples: [])
+    }
+}
+
+struct TimelineClipRow: View {
+    var videoURL: URL?
+    var duration: Double
+    var currentTime: Double
+    var viewport: TimelineViewport
+    var splitTimes: [Double]
+    var trimRegions: [TimelineTrimRegion]
+    var clipSpeeds: [Int: Double]
+    var selectedClipIndex: Int?
+    var seek: (Double) -> Void
+    var onScrubbingChanged: ((Bool) -> Void)? = nil
+    var edits: TimelineEditDriver
+    @State private var waveformSamples: [Double]?
+
+    @State private var clipResize: (index: Int, edge: TimelineCameraResizeEdge, time: Double, secondsPerPoint: Double, original: TimelineEditSnapshot)?
+
+    var body: some View {
+        GeometryReader { proxy in
+            ZStack(alignment: .leading) {
+                Rectangle()
+                    .fill(Color(red: 0.095, green: 0.095, blue: 0.11))
+                if videoURL != nil {
+                    clipSegments(width: proxy.size.width)
+                } else {
+                    Text("No clip")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(Color.secondary.opacity(0.64))
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .allowsHitTesting(false)
+                }
+            }
+            .clipped()
+            .rectangularHitTarget()
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { value in
+                        onScrubbingChanged?(true)
+                        seek(to: value.location.x, width: proxy.size.width)
+                    }
+                    .onEnded { value in
+                        onScrubbingChanged?(false)
+                        selectClip(at: value.location.x, width: proxy.size.width)
+                    }
+            )
+        }
+        .frame(height: TimelineMetrics.clipHeight)
+        .overlay(alignment: .bottom) { Rectangle().fill(Theme.border).frame(height: 1) }
+        .task(id: videoURL) { await loadWaveform() }
+    }
+
+    private func clipSegments(width: CGFloat) -> some View {
+        let original = clipResize?.original ?? edits.snapshot
+        let segments = original.clipSegments(duration: duration)
+            .filter { segment in
+                !original.trimRegions.contains { $0.span.start <= segment.start + 0.001 && $0.span.end >= segment.end - 0.001 }
+            }
+            .map { segment -> TimelineClipSegment in
+                guard let drag = clipResize, segment.index == drag.index,
+                      var resized = edits.selectedClip(duration: duration) else { return segment }
+                // Keep the gesture's view identity stable when a new trim boundary
+                // changes the clip's source index during the drag.
+                resized.index = segment.index
+                return resized
+            }
+            .filter { viewport.intersects($0.span) }
+        return ZStack(alignment: .leading) {
+            ForEach(segments) { segment in
+                let startX = x(for: segment.start, width: width)
+                let endX = x(for: segment.end, width: width)
+                let segmentWidth = max(1, endX - startX - (segments.count > 1 ? 3 : 0))
+                clipBody(segment: segment, width: segmentWidth, isSelected: selectedClipIndex == segment.index, isDeleted: isDeleted(segment))
+                    .contextMenu {
+                        Button {
+                            edits.addClipSplit(at: currentTime, duration: duration)
+                        } label: {
+                            Label("Split at Playhead", systemImage: "scissors")
+                        }
+                        .disabled(!canSplitAtPlayhead(segment: segment, isDeleted: isDeleted(segment)))
+
+                        Button(role: .destructive) {
+                            edits.deleteRecordingClip(index: segment.index, duration: duration)
+                        } label: {
+                            Label("Delete", systemImage: "trash")
+                        }
+                        .disabled(isDeleted(segment) || !edits.canDeleteRecordingClip(index: segment.index, duration: duration))
+                    }
+                    .frame(width: segmentWidth, height: TimelineMetrics.clipHeight)
+                    .overlay(alignment: .leading) { clipEdge(segment, edge: .leading, width: width) }
+                    .overlay(alignment: .trailing) { clipEdge(segment, edge: .trailing, width: width) }
+                    .position(x: startX + (endX - startX) / 2, y: TimelineMetrics.clipHeight / 2)
+            }
+        }
+    }
+
+    private func clipEdge(_ segment: TimelineClipSegment, edge: TimelineCameraResizeEdge, width: CGFloat) -> some View {
+        TimelineResizeHandle(usesResizeCursor: true)
+            .frame(width: 12, height: TimelineMetrics.clipHeight - 14)
+            .contentShape(Rectangle())
+            .highPriorityGesture(DragGesture(minimumDistance: 2, coordinateSpace: .global)
+                .onChanged { value in
+                    if clipResize == nil {
+                        edits.beginUndoTransaction()
+                        clipResize = (segment.index, edge, edge == .leading ? segment.start : segment.end,
+                                      width > 0 ? viewport.visibleDuration / Double(width) * segment.speed : 0,
+                                      edits.snapshot)
+                    }
+                    guard let drag = clipResize else { return }
+                    edits.send(.resizeRecordingClip(index: drag.index, edge: drag.edge,
+                        time: drag.time + Double(value.translation.width) * drag.secondsPerPoint,
+                        duration: duration, original: drag.original))
+                }
+                .onEnded { _ in
+                    edits.endUndoTransaction()
+                    clipResize = nil
+                })
+            .help("Drag to trim or restore hidden footage")
+            .accessibilityLabel(edge == .leading ? "Clip start" : "Clip end")
+    }
+
+    private func clipBody(segment: TimelineClipSegment, width: CGFloat, isSelected: Bool, isDeleted: Bool) -> some View {
+        let foreground = isDeleted ? Color.white.opacity(0.48) : Theme.timelineClipForeground
+        return RoundedRectangle(cornerRadius: 6, style: .continuous)
+            .fill(
+                isDeleted
+                    ? LinearGradient(
+                        colors: [Color.secondary.opacity(0.24), Color.secondary.opacity(0.14)],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                    : (isSelected
+                        ? LinearGradient(
+                            colors: [Theme.accent.opacity(0.92), Theme.accent.opacity(0.76)],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                        : LinearGradient(
+                            colors: [
+                                Color(red: 0.14, green: 0.18, blue: 0.32),
+                                Color(red: 0.09, green: 0.12, blue: 0.22)
+                            ],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        ))
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .strokeBorder(
+                        LinearGradient(
+                            colors: [
+                                Color.white.opacity(isSelected ? 0.65 : 0.18),
+                                Color.white.opacity(isSelected ? 0.25 : 0.05)
+                            ],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        ),
+                        lineWidth: isSelected ? 1.5 : 1.0
+                    )
+            }
+            .shadow(
+                color: isSelected ? Theme.accent.opacity(0.35) : Color.black.opacity(0.20),
+                radius: isSelected ? 6 : 2,
+                y: 1
+            )
+            .overlay(alignment: .bottom) {
+                if !isDeleted {
+                    TimelineWaveformPreview(samples: waveformSamples(for: segment) ?? (waveformSamples ?? []))
+                        .frame(height: 24)
+                        .padding(.horizontal, 8)
+                        .padding(.bottom, 6)
+                        .allowsHitTesting(false)
+                }
+            }
+            .overlay(alignment: .topLeading) {
+                if width > 70 {
+                    HStack(spacing: 5) {
+                        Image(systemName: isDeleted ? "trash" : "rectangle.on.rectangle")
+                            .font(.system(size: 8.5, weight: .semibold))
+                        Text(isDeleted ? "Deleted" : "Clip \(segment.index + 1)")
+                            .font(.system(size: 9.5, weight: .semibold))
+                        Text("· \(formatClipDuration(segment.end - segment.start)) @ \(TimelineClipSpeed.label(segment.speed))")
+                            .font(.system(size: 9, weight: .medium, design: .monospaced))
+                    }
+                    .foregroundStyle(foreground)
+                    .shadow(color: Color.black.opacity(0.40), radius: 2, y: 1)
+                    .padding(.top, 6)
+                    .padding(.leading, 10)
+                    .allowsHitTesting(false)
+                }
+            }
+            .overlay(alignment: .topTrailing) {
+                if width > 130 {
+                    Text(formatPlaybackTime(segment.end))
+                        .font(.system(size: 9, weight: .medium, design: .monospaced))
+                        .foregroundStyle(foreground.opacity(0.70))
+                        .shadow(color: Color.black.opacity(0.40), radius: 2, y: 1)
+                        .padding(.top, 6)
+                        .padding(.trailing, 10)
+                        .allowsHitTesting(false)
+                }
+            }
+            .padding(.vertical, 5)
+            .padding(.horizontal, 2)
+    }
+
+    private func waveformSamples(for segment: TimelineClipSegment) -> [Double]? {
+        guard let fullSamples = waveformSamples, !fullSamples.isEmpty, duration > 0 else {
+            return nil
+        }
+        let totalCount = fullSamples.count
+        let startRatio = max(0.0, min(segment.start / duration, 1.0))
+        let endRatio = max(startRatio, min(segment.end / duration, 1.0))
+        let startIdx = min(Int(startRatio * Double(totalCount)), totalCount - 1)
+        let endIdx = min(max(startIdx + 1, Int(endRatio * Double(totalCount))), totalCount)
+        return Array(fullSamples[startIdx..<endIdx])
+    }
+
+    private func isDeleted(_ segment: TimelineClipSegment) -> Bool {
+        trimRegions.contains { region in
+            region.span.start <= segment.start + 0.001 && region.span.end >= segment.end - 0.001
+        }
+    }
+
+    private func canSplitAtPlayhead(segment: TimelineClipSegment, isDeleted: Bool) -> Bool {
+        guard !isDeleted, duration.isFinite, duration > 0 else { return false }
+        let minimumDistance = min(0.05, duration / 4)
+        return currentTime > segment.start + minimumDistance && currentTime < segment.end - minimumDistance
+    }
+
+    private func seek(to x: CGFloat, width: CGFloat) {
+        guard let time = TimelineSeekMapper.time(forX: x, viewport: viewport, width: width) else { return }
+        seek(time)
+    }
+
+    private func selectClip(at x: CGFloat, width: CGFloat) {
+        guard videoURL != nil, duration.isFinite, duration > 0, width > 0 else {
+            edits.clearSelection()
+            return
+        }
+
+        guard let time = TimelineSeekMapper.time(forX: x, viewport: viewport, width: width) else {
+            edits.clearSelection()
+            return
+        }
+        let segments = TimelineClipSegment.segments(duration: duration, splitTimes: splitTimes, clipSpeeds: clipSpeeds)
+        guard let segment = segments.first(where: { time >= $0.start && (time < $0.end || $0.index == segments.last?.index) }) else {
+            edits.clearSelection()
+            return
+        }
+
+        edits.selectClip(index: segment.index)
+    }
+
+    private func x(for time: Double, width: CGFloat) -> CGFloat {
+        viewport.x(for: time, width: width, clamped: true) ?? 0
+    }
+
+    private func loadWaveform() async {
+        guard let videoURL else { waveformSamples = nil; return }
+        waveformSamples = nil
+        let waveform = await TimelineAudioWaveformLoader.loadWaveform(from: videoURL)
+        guard !Task.isCancelled else { return }
+        waveformSamples = waveform.isAvailable ? waveform.samples : nil
+    }
+}
+
+struct TimelineResizeHandle: View {
+    var usesResizeCursor = false
+    @State private var isHovering = false
+
+    var body: some View {
+        RoundedRectangle(cornerRadius: 3, style: .continuous)
+            .fill(isHovering ? Color.white : Color.white.opacity(0.90))
+            .frame(width: 7, height: 20)
+            .overlay {
+                RoundedRectangle(cornerRadius: 3, style: .continuous)
+                    .stroke(Color.black.opacity(0.35), lineWidth: 0.8)
+            }
+            .overlay {
+                HStack(spacing: 1.5) {
+                    Rectangle().fill(Color.black.opacity(0.35)).frame(width: 1, height: 9)
+                    Rectangle().fill(Color.black.opacity(0.35)).frame(width: 1, height: 9)
+                }
+            }
+            .shadow(color: Color.black.opacity(0.35), radius: 3, y: 1)
+            .scaleEffect(isHovering ? 1.15 : 1.0)
+            .animation(.snappy(duration: 0.15), value: isHovering)
+            .onHover { hovering in
+                guard hovering != isHovering else { return }
+                isHovering = hovering
+                if usesResizeCursor {
+                    if hovering { NSCursor.resizeLeftRight.push() } else { NSCursor.pop() }
+                }
+            }
+            .onDisappear {
+                if usesResizeCursor && isHovering { NSCursor.pop() }
+            }
+    }
+}
+
+struct TimelineWaveformPreview: View {
+    var samples: [Double]
+
+    var body: some View {
+        GeometryReader { proxy in
+            let width = max(proxy.size.width, 1)
+            let barWidth: CGFloat = 2.5
+            let barSpacing: CGFloat = 1.6
+            let totalStep = barWidth + barSpacing
+            let barCount = max(1, Int(width / totalStep))
+            let downsampled = resample(samples: samples, count: barCount)
+
+            Canvas { context, size in
+                let midY = size.height / 2
+                let maxH = size.height - 4
+
+                // Pass 1: Soft peak glow behind loud/tallest bars
+                for i in 0..<barCount {
+                    let amp = CGFloat(i < downsampled.count ? downsampled[i] : 0.2)
+                    if amp > 0.48 {
+                        let peakIntensity = (amp - 0.48) / 0.52 // 0.0 to 1.0
+                        let barH = max(3.0, amp * maxH)
+                        let x = CGFloat(i) * totalStep
+                        let glowRect = CGRect(
+                            x: x - 2.0,
+                            y: midY - (barH + 4.0) / 2,
+                            width: barWidth + 4.0,
+                            height: barH + 4.0
+                        )
+                        let glowPath = Path(roundedRect: glowRect, cornerRadius: (barWidth + 4.0) / 2)
+                        context.fill(glowPath, with: .color(Theme.accent.opacity(Double(0.40 * peakIntensity))))
+                    }
+                }
+
+                // Pass 2: Main waveform bars using existing Theme.accent design token
+                let barShading = GraphicsContext.Shading.color(Theme.accent)
+
+                for i in 0..<barCount {
+                    let amp = CGFloat(i < downsampled.count ? downsampled[i] : 0.2)
+                    let barH = max(3.0, amp * maxH)
+                    let x = CGFloat(i) * totalStep
+                    let rect = CGRect(
+                        x: x,
+                        y: midY - barH / 2,
+                        width: barWidth,
+                        height: barH
+                    )
+                    let path = Path(roundedRect: rect, cornerRadius: barWidth / 2)
+                    context.fill(path, with: barShading)
+                }
+            }
+        }
+        .allowsHitTesting(false)
+    }
+
+    private func resample(samples: [Double], count: Int) -> [Double] {
+        guard count > 0 else { return [] }
+        guard !samples.isEmpty else {
+            // Organic audio rhythm pattern when audio track is silent or loading
+            return (0..<count).map { i in
+                let t = Double(i)
+                let wave1 = sin(t * 0.24) * 0.38
+                let wave2 = cos(t * 0.08) * 0.32
+                let wave3 = sin(t * 0.62) * 0.18
+                let combined = abs(wave1 + wave2 + wave3) + 0.12
+                return min(max(combined, 0.10), 0.92)
+            }
+        }
+        let step = Double(samples.count) / Double(count)
+        return (0..<count).map { i in
+            let startIdx = Int(Double(i) * step)
+            let endIdx = min(Int(Double(i + 1) * step), samples.count)
+            if startIdx < endIdx {
+                var maxVal = 0.0
+                for j in startIdx..<endIdx {
+                    maxVal = max(maxVal, samples[j])
+                }
+                let shaped = pow(maxVal, 0.58)
+                return max(0.10, min(shaped, 1.0))
+            } else if startIdx < samples.count {
+                let shaped = pow(samples[startIdx], 0.58)
+                return max(0.10, min(shaped, 1.0))
+            }
+            return 0.10
+        }
+    }
+}
+
+struct TimelineWaveformChartSample: Identifiable {
+    var id: Int { index }
+    var index: Int
+    var position: Int
+    var amplitude: Double
+
+    static func samples(from samples: [Double], width: CGFloat) -> [TimelineWaveformChartSample] {
+        let levels = TimelineWaveformBarRenderer.resampledLevels(from: samples, width: width)
+        let smoothedLevels = TimelineWaveformBarRenderer.smoothedDisplayLevels(from: levels)
+        return smoothedLevels.enumerated().map { index, sample in
+            let clampedSample = min(max(sample, 0), 1)
+            let shapedAmplitude = max(0.07, pow(clampedSample, 0.54))
+            return TimelineWaveformChartSample(
+                index: index,
+                position: index,
+                amplitude: min(max(shapedAmplitude, 0), 1)
+            )
+        }
+    }
+}
+
+enum TimelineWaveformBarRenderer {
+    static func resampledLevels(from samples: [Double], width: CGFloat) -> [Double] {
+        guard width > 0, !samples.isEmpty else { return [] }
+
+        let targetCount = max(2, min(samples.count, Int(width / 3.2)))
+        guard targetCount < samples.count else {
+            return samples.map { min(max($0, 0), 1) }
+        }
+
+        return (0..<targetCount).map { bucket in
+            let start = Int((Double(bucket) / Double(targetCount)) * Double(samples.count))
+            let end = max(start + 1, Int((Double(bucket + 1) / Double(targetCount)) * Double(samples.count)))
+            return samples[start..<min(end, samples.count)].reduce(0) { partial, sample in
+                max(partial, min(max(sample, 0), 1))
+            }
+        }
+    }
+
+    static func smoothedDisplayLevels(from levels: [Double]) -> [Double] {
+        guard levels.count > 2 else {
+            return levels.map { min(max($0, 0), 1) }
+        }
+
+        return levels.indices.map { index in
+            let previous = levels[max(index - 1, 0)]
+            let current = levels[index]
+            let next = levels[min(index + 1, levels.count - 1)]
+            let weightedLevel = previous * 0.22 + current * 0.56 + next * 0.22
+            return min(max(weightedLevel, 0), 1)
+        }
+    }
+}
+
+func formatClipDuration(_ seconds: Double) -> String {
+    guard seconds.isFinite, seconds > 0 else { return "0s" }
+    if seconds < 60 { return "\(max(1, Int(seconds.rounded())))s" }
+    return formatPlaybackTime(seconds)
+}
+
+struct TimelineRegionRenderData: Identifiable {
+    var id: TimelineRegionID
+    var span: TimelineSpan
+    var label: String
+    var mode: TimelineZoomMode?
+
+    var showsAutoBadge: Bool {
+        mode == .auto
+    }
+
+    static func zoom(_ zoom: TimelineZoomRegion) -> TimelineRegionRenderData {
+        TimelineRegionRenderData(
+            id: zoom.id,
+            span: zoom.span,
+            label: TimelineZoomDepth.label(zoom.depth),
+            mode: zoom.mode
+        )
+    }
+}
+
+struct TimelineLayerRow: View {
+    var kind: TimelineRegionKind
+    var duration: Double
+    var viewport: TimelineViewport
+    var regions: [TimelineRegionRenderData]
+    var selectedID: TimelineRegionID?
+    var edits: TimelineEditDriver
+
+    var body: some View {
+        GeometryReader { proxy in
+            ZStack(alignment: .leading) {
+                Rectangle()
+                    .fill(Color(red: 0.095, green: 0.095, blue: 0.11))
+                    .rectangularHitTarget()
+                    .gesture(
+                        SpatialTapGesture()
+                            .onEnded { value in
+                                handleBackgroundTap(at: value.location, width: proxy.size.width)
+                            }
+                    )
+                if regions.isEmpty {
+                    Text(emptyMessage)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(Color.secondary.opacity(0.64))
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+                        .allowsHitTesting(false)
+                }
+                ForEach(regions.filter { viewport.intersects($0.span) }) { region in
+                    TimelineRegionItem(kind: kind, region: region, duration: duration, viewport: viewport, width: proxy.size.width, isSelected: kind == .zoom ? edits.selectedZoomIDs.contains(region.id) : region.id == selectedID, edits: edits)
+                }
+            }
+            .rectangularHitTarget()
+            .clipped()
+        }
+        .frame(height: TimelineMetrics.layerHeight)
+        .overlay(alignment: .bottom) { Rectangle().fill(Theme.border).frame(height: 1) }
+    }
+
+    private var emptyMessage: String {
+        switch kind {
+        case .zoom:
+            "Click or press Z to add zoom"
+        case .annotation:
+            "Annotations are currently unavailable"
+        case .trim:
+            "Trim sections are no longer available"
+        }
+    }
+
+    private func handleBackgroundTap(at location: CGPoint, width: CGFloat) {
+        guard kind == .zoom,
+              duration.isFinite,
+              duration > 0,
+              let time = TimelineSeekMapper.time(forX: location.x, viewport: viewport, width: width) else {
+            edits.clearSelection()
+            return
+        }
+
+        edits.add(.zoom, at: time, duration: duration)
+    }
+}
+
+struct TimelineCameraLayerRow: View {
+    var duration: Double
+    var currentTime: Double
+    var viewport: TimelineViewport
+    var hasRecordedCamera: Bool
+    var fallbackSettings: FacecamSettings?
+    var cameraClips: [TimelineCameraClip]
+    var selectedID: TimelineRegionID?
+    var edits: TimelineEditDriver
+
+    var body: some View {
+        GeometryReader { proxy in
+            ZStack(alignment: .leading) {
+                Rectangle()
+                    .fill(Color(red: 0.095, green: 0.095, blue: 0.11))
+                    .rectangularHitTarget()
+                    .gesture(
+                        SpatialTapGesture()
+                            .onEnded { value in
+                                handleBackgroundTap(at: value.location, width: proxy.size.width)
+                            }
+                    )
+
+                if cameraClips.isEmpty {
+                    Text(emptyMessage)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(Color.secondary.opacity(0.64))
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+                        .allowsHitTesting(false)
+                }
+
+                ForEach(cameraClips.filter { viewport.intersects($0.span) }) { clip in
+                    TimelineCameraClipItem(
+                        clip: clip,
+                        duration: duration,
+                        currentTime: currentTime,
+                        viewport: viewport,
+                        width: proxy.size.width,
+                        isSelected: clip.id == selectedID,
+                        fallbackSettings: fallbackSettings,
+                        edits: edits
+                    )
+                }
+            }
+            .rectangularHitTarget()
+            .clipped()
+        }
+        .frame(height: TimelineMetrics.layerHeight)
+        .overlay(alignment: .bottom) { Rectangle().fill(Theme.border).frame(height: 1) }
+    }
+
+    private var emptyMessage: String {
+        hasRecordedCamera ? "Camera settings unavailable" : "No camera recorded"
+    }
+
+    private func handleBackgroundTap(at location: CGPoint, width: CGFloat) {
+        guard hasRecordedCamera,
+              duration.isFinite,
+              duration > 0,
+              let time = TimelineSeekMapper.time(forX: location.x, viewport: viewport, width: width) else {
+            edits.clearSelection()
+            return
+        }
+
+        guard let clip = cameraClips.first(where: { time >= $0.span.start && (time < $0.span.end || $0.id == cameraClips.last?.id) }) else {
+            edits.clearSelection()
+            return
+        }
+        edits.selectCameraClip(id: clip.id)
+    }
+}
+
+private struct TimelineCameraClipItem: View {
+    var clip: TimelineCameraClip
+    var duration: Double
+    var currentTime: Double
+    var viewport: TimelineViewport
+    var width: CGFloat
+    var isSelected: Bool
+    var fallbackSettings: FacecamSettings?
+    var edits: TimelineEditDriver
+
+    @State private var resizeStartTime: Double?
+    @State private var isHovering = false
+
+    private var accentColor: Color {
+        Color(red: 0.18, green: 0.82, blue: 0.48)
+    }
+
+    private var shapeTitle: String {
+        guard clip.settings.clamped.enabled else { return "Hidden" }
+        if clip.settings.resolvedLayout != .overlay { return clip.settings.resolvedLayout.title }
+        switch clip.settings.clamped.normalizedShape {
+        case "circle": return "Circle"
+        case "square": return "Square"
+        case "rectangle": return "Rectangle"
+        default: return "Camera"
+        }
+    }
+
+    private var shapeSymbolName: String {
+        guard clip.settings.clamped.enabled else { return "camera.slash.fill" }
+        switch clip.settings.resolvedLayout {
+        case .cameraOnly: return "camera.fill"
+        case .split: return "rectangle.split.2x1"
+        case .sideBySide: return "rectangle.inset.filled.trailing"
+        case .overlay: break
+        }
+        switch clip.settings.clamped.normalizedShape {
+        case "circle": return "circle.fill"
+        case "square": return "square.fill"
+        case "rectangle": return "rectangle.fill"
+        default: return "camera.fill"
+        }
+    }
+
+    var body: some View {
+        let startX = x(for: clip.span.start)
+        let itemWidth = max(1, x(for: clip.span.end) - startX)
+
+        Button {
+            edits.selectCameraClip(id: clip.id)
+        } label: {
+            ZStack {
+                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                    .fill(
+                        clip.settings.clamped.enabled
+                            ? (isSelected ? accentColor.opacity(0.18) : accentColor.opacity(0.07))
+                            : Color.secondary.opacity(0.06)
+                    )
+
+                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                    .strokeBorder(
+                        clip.settings.clamped.enabled
+                            ? (isSelected ? accentColor.opacity(0.90) : accentColor.opacity(0.25))
+                            : Color.secondary.opacity(0.20),
+                        lineWidth: isSelected ? 1.5 : 0.8
+                    )
+
+                if isSelected {
+                    RoundedRectangle(cornerRadius: 5, style: .continuous)
+                        .stroke(accentColor.opacity(0.35), lineWidth: 3)
+                        .blur(radius: 2)
+                }
+
+                label(width: itemWidth)
+            }
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(clip.settings.clamped.enabled ? "Camera clip" : "Hidden camera clip")
+        .accessibilityValue("\(shapeTitle), \(timeRangeDescription)")
+        .accessibilityHint("Select to edit this segment’s layout. Drag either edge to change its timing.")
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+        .frame(width: itemWidth, height: TimelineMetrics.regionItemHeight)
+        .overlay(alignment: .leading) {
+            if (isSelected || isHovering), (viewport.editPlan?.timelineTime(forSourceTime: clip.span.start) ?? clip.span.start) >= viewport.visibleStart - 0.001 {
+                resizeHandle(edge: .leading, hitWidth: min(18, itemWidth / 2))
+            }
+        }
+        .overlay(alignment: .trailing) {
+            if (isSelected || isHovering), (viewport.editPlan?.timelineTime(forSourceTime: clip.span.end) ?? clip.span.end) <= viewport.visibleEnd + 0.001 {
+                resizeHandle(edge: .trailing, hitWidth: min(18, itemWidth / 2))
+            }
+        }
+        .onHover { isHovering = $0 }
+        .onDisappear {
+            if resizeStartTime != nil {
+                edits.endUndoTransaction()
+                resizeStartTime = nil
+            }
+        }
+        .zIndex(isSelected ? 1 : 0)
+        .position(x: startX + itemWidth / 2, y: TimelineMetrics.layerHeight / 2)
+        .contextMenu {
+            Button {
+                CameraTransitionStore.shared.copy(clip.settings.resolvedLayoutTransition)
+            } label: {
+                Label("Copy Transition", systemImage: "doc.on.doc")
+            }
+            Button {
+                if let transition = CameraTransitionStore.shared.copiedTransition {
+                    edits.applyCameraTransition(transition, to: [clip.id])
+                }
+            } label: {
+                Label("Paste Transition", systemImage: "doc.on.clipboard")
+            }
+            .disabled(CameraTransitionStore.shared.copiedTransition == nil)
+            Button {
+                edits.applyCameraTransition(clip.settings.resolvedLayoutTransition, to: edits.cameraClips.map(\.id))
+            } label: {
+                Label("Copy to All Transitions", systemImage: "rectangle.stack")
+            }
+            .disabled(edits.cameraClips.count < 2)
+            Divider()
+            Menu("Layout for This Segment") {
+                ForEach(CameraLayout.allCases) { layout in
+                    Button {
+                        var settings = clip.settings
+                        settings.layout = layout.rawValue
+                        edits.updateCameraClipSettings(id: clip.id, settings: settings)
+                    } label: {
+                        if clip.settings.resolvedLayout == layout {
+                            Label(layout.title, systemImage: "checkmark")
+                        } else {
+                            Text(layout.title)
+                        }
+                    }
+                }
+            }
+            if clip.settings.resolvedLayout == .overlay {
+                Menu("Camera Position for This Segment") {
+                    ForEach(FacecamAnchor.allCases) { anchor in
+                        Button {
+                            var settings = clip.settings
+                            settings.anchor = anchor.rawValue
+                            edits.updateCameraClipSettings(id: clip.id, settings: settings)
+                        } label: {
+                            if clip.settings.resolvedAnchor == anchor {
+                                Label(anchor.title, systemImage: "checkmark")
+                            } else {
+                                Text(anchor.title)
+                            }
+                        }
+                    }
+                }
+            } else if clip.settings.resolvedLayout.hasScreenPanel {
+                Menu("Camera Side for This Segment") {
+                    ForEach([true, false], id: \.self) { left in
+                        Button {
+                            var settings = clip.settings
+                            settings.cameraOnLeft = left
+                            edits.updateCameraClipSettings(id: clip.id, settings: settings)
+                        } label: {
+                            if clip.settings.resolvedCameraOnLeft == left {
+                                Label(left ? "Left" : "Right", systemImage: "checkmark")
+                            } else {
+                                Text(left ? "Left" : "Right")
+                            }
+                        }
+                    }
+                }
+            }
+            if clip.settings.resolvedLayout != .overlay {
+                Toggle("Keep Face Centered", isOn: Binding(
+                    get: { clip.settings.keepsFaceCentered },
+                    set: { value in
+                        var settings = clip.settings
+                        settings.centerFace = value
+                        edits.updateCameraClipSettings(id: clip.id, settings: settings)
+                    }))
+            }
+            Divider()
+            Button {
+                edits.splitCameraClip(at: currentTime, duration: duration, fallback: fallbackSettings)
+            } label: {
+                Label("Split at Playhead", systemImage: "scissors")
+            }
+            .disabled(!canSplitAtPlayhead)
+
+            Button(role: .destructive) {
+                edits.deleteCameraClip(id: clip.id, duration: duration, fallback: fallbackSettings)
+            } label: {
+                Label("Delete", systemImage: "trash")
+            }
+            .disabled(!edits.canDeleteCameraClip(id: clip.id, duration: duration, fallback: fallbackSettings))
+        }
+    }
+
+    private func resizeHandle(edge: TimelineCameraResizeEdge, hitWidth: CGFloat) -> some View {
+        TimelineResizeHandle(usesResizeCursor: true)
+            .frame(width: max(1, hitWidth), height: TimelineMetrics.regionItemHeight)
+            .clipped()
+            .contentShape(Rectangle())
+            .highPriorityGesture(
+                DragGesture(minimumDistance: 2, coordinateSpace: .global)
+                    .onChanged { value in
+                        guard width > 0, viewport.visibleDuration.isFinite else { return }
+                        if resizeStartTime == nil {
+                            edits.beginUndoTransaction()
+                            resizeStartTime = edge == .leading ? clip.span.start : clip.span.end
+                            edits.selectCameraClip(id: clip.id)
+                        }
+                        let delta = Double(value.translation.width / width) * viewport.visibleDuration
+                        edits.resizeCameraClip(id: clip.id, edge: edge, time: (resizeStartTime ?? 0) + delta, duration: duration)
+                    }
+                    .onEnded { _ in
+                        edits.endUndoTransaction()
+                        resizeStartTime = nil
+                    }
+            )
+            .help(edge == .leading ? "Drag to change layout start" : "Drag to change layout end")
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(edge == .leading ? "Layout start" : "Layout end")
+            .accessibilityValue(String(format: "%.2f seconds", edge == .leading ? clip.span.start : clip.span.end))
+            .accessibilityAdjustableAction { direction in
+                let time = edge == .leading ? clip.span.start : clip.span.end
+                switch direction {
+                case .increment: edits.resizeCameraClip(id: clip.id, edge: edge, time: time + 0.1, duration: duration)
+                case .decrement: edits.resizeCameraClip(id: clip.id, edge: edge, time: time - 0.1, duration: duration)
+                @unknown default: break
+                }
+            }
+    }
+
+    @ViewBuilder
+    private func label(width: CGFloat) -> some View {
+        if width > 58 {
+            HStack(spacing: 4.5) {
+                Image(systemName: shapeSymbolName)
+                    .font(.system(size: 8.5, weight: .medium))
+                Text(shapeTitle)
+                    .font(.system(size: 10, weight: .semibold))
+                    .lineLimit(1)
+            }
+            .foregroundStyle(
+                clip.settings.clamped.enabled
+                    ? (isSelected ? Color.white : accentColor.opacity(0.92))
+                    : Color.secondary.opacity(0.70)
+            )
+            .minimumScaleFactor(0.75)
+            .padding(.horizontal, 6)
+            .frame(maxWidth: max(1, width))
+            .allowsHitTesting(false)
+        } else if width > 22 {
+            Image(systemName: shapeSymbolName)
+                .font(.system(size: 8.5, weight: .medium))
+                .foregroundStyle(
+                    clip.settings.clamped.enabled
+                        ? (isSelected ? Color.white : accentColor.opacity(0.92))
+                        : Color.secondary.opacity(0.70)
+                )
+                .allowsHitTesting(false)
+        }
+    }
+
+    private func x(for time: Double) -> CGFloat {
+        viewport.x(for: time, width: width, clamped: true) ?? 0
+    }
+
+    private var canSplitAtPlayhead: Bool {
+        guard duration.isFinite, duration > 0 else { return false }
+        let minimumDistance = min(0.05, duration / 4)
+        return currentTime > clip.span.start + minimumDistance && currentTime < clip.span.end - minimumDistance
+    }
+
+    private var timeRangeDescription: String {
+        "\(clip.span.start.formatted(.number.precision(.fractionLength(1)))) to \(clip.span.end.formatted(.number.precision(.fractionLength(1)))) seconds"
+    }
+}
+
+struct TimelineRegionItem: View {
+    var kind: TimelineRegionKind
+    var region: TimelineRegionRenderData
+    var duration: Double
+    var viewport: TimelineViewport
+    var width: CGFloat
+    var isSelected: Bool
+    var edits: TimelineEditDriver
+    @State private var drag: TimelineRegionDrag?
+
+    var body: some View {
+        let startX = x(for: region.span.start)
+        let itemWidth = max(1, x(for: region.span.end) - startX)
+
+        Button {
+            if kind == .zoom {
+                edits.selectZoom(region.id, toggle: NSEvent.modifierFlags.contains(.command),
+                                 range: NSEvent.modifierFlags.contains(.shift))
+            } else {
+                edits.select(kind, id: region.id)
+            }
+        } label: {
+            regionBody(width: itemWidth)
+        }
+        .buttonStyle(.plain)
+        .frame(width: itemWidth, height: TimelineMetrics.regionItemHeight)
+        .simultaneousGesture(TapGesture(count: 2).onEnded {
+            guard NSEvent.modifierFlags.intersection([.command, .shift]).isEmpty else { return }
+            performPrimaryEdit()
+        })
+        .gesture(dragGesture(operation: .move))
+        // Handles are siblings of the movable button, so resizing cannot also move it.
+        .overlay(alignment: .leading) {
+            if showsLeadingHandle { resizeHandle(operation: .leading).offset(x: -18) }
+        }
+        .overlay(alignment: .trailing) {
+            if showsTrailingHandle { resizeHandle(operation: .trailing).offset(x: 18) }
+        }
+        .position(x: startX + itemWidth / 2, y: TimelineMetrics.layerHeight / 2)
+        .transaction { $0.animation = nil }
+        .onDisappear { finishDrag() }
+        .contextMenu {
+            if kind == .zoom, let zoom = edits.zoomRegions.first(where: { $0.id == region.id }) {
+                ZoomTransitionMenu(region: zoom, edits: edits)
+            }
+        }
+        .accessibilityLabel("\(kind.title) region")
+        .accessibilityValue(regionAccessibilityValue)
+        .accessibilityHint(regionAccessibilityHint)
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+
+    private func regionBody(width: CGFloat) -> some View {
+        Group {
+            if kind == .zoom {
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(
+                        LinearGradient(
+                            colors: [
+                                (isSelected ? Theme.accent : Color(red: 0.38, green: 0.28, blue: 0.88)).opacity(isSelected ? 0.82 : 0.58),
+                                (isSelected ? Theme.accent.opacity(0.95) : Color(red: 0.28, green: 0.18, blue: 0.72)).opacity(isSelected ? 0.95 : 0.72)
+                            ],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .stroke(
+                                isSelected ? Color.white.opacity(0.88) : Color(red: 0.52, green: 0.44, blue: 0.98).opacity(0.70),
+                                lineWidth: isSelected ? 1.5 : 1
+                            )
+                    }
+                    .shadow(color: (isSelected ? Theme.accent : Color(red: 0.38, green: 0.28, blue: 0.88)).opacity(isSelected ? 0.40 : 0.20), radius: isSelected ? 6 : 3, y: 1)
+            } else {
+                Rectangle()
+                    .fill(kind.accent.opacity(isSelected ? 0.55 : 0.34))
+                    .overlay { Rectangle().stroke(kind.accent.opacity(isSelected ? 0.95 : 0.65), lineWidth: isSelected ? 2 : 1) }
+            }
+        }
+        .overlay { regionLabel(width: width) }
+
+    }
+
+    private func regionLabel(width: CGFloat) -> some View {
+        HStack(spacing: 4) {
+            if kind == .zoom {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(Color.white.opacity(0.92))
+            }
+
+            Text(region.label)
+                .font(.system(size: 10, weight: .bold, design: .rounded))
+                .foregroundStyle(.white)
+                .lineLimit(1)
+
+            if region.showsAutoBadge, width > 64 {
+                Text("Auto")
+                    .font(.system(size: 8, weight: .bold))
+                    .foregroundStyle(.white.opacity(0.92))
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 1)
+                    .background(Color.black.opacity(0.28), in: RoundedRectangle(cornerRadius: 3, style: .continuous))
+            }
+        }
+        .minimumScaleFactor(0.75)
+        .padding(.horizontal, 7)
+        .frame(maxWidth: max(0, width - 8))
+    }
+
+    private var showsLeadingHandle: Bool {
+        (viewport.editPlan?.timelineTime(forSourceTime: region.span.start) ?? region.span.start) >= viewport.visibleStart - 0.001 || drag?.operation == .leading
+    }
+
+    private var showsTrailingHandle: Bool {
+        (viewport.editPlan?.timelineTime(forSourceTime: region.span.end) ?? region.span.end) <= viewport.visibleEnd + 0.001 || drag?.operation == .trailing
+    }
+
+    private func resizeHandle(operation: TimelineRegionDrag.Operation) -> some View {
+        TimelineResizeHandle(usesResizeCursor: true)
+            .frame(width: 18, height: TimelineMetrics.regionItemHeight)
+            .contentShape(Rectangle())
+            .gesture(dragGesture(operation: operation))
+            .accessibilityLabel(operation == .leading ? "Resize start" : "Resize end")
+    }
+
+    private func dragGesture(operation: TimelineRegionDrag.Operation) -> some Gesture {
+        // Local coordinates change when the dragged edge moves. Freeze both the
+        // original span and time-per-point before selection can resize the sidebar.
+        DragGesture(minimumDistance: 2, coordinateSpace: .global)
+            .onChanged { value in
+                if drag == nil {
+                    drag = TimelineRegionDrag(span: region.span, operation: operation,
+                        secondsPerPoint: width > 0 ? viewport.visibleDuration / Double(width) : 0)
+                    edits.beginUndoTransaction()
+                    edits.select(kind, id: region.id)
+                }
+                updateDrag(translation: value.translation.width)
+            }
+            .onEnded { value in
+                updateDrag(translation: value.translation.width)
+                finishDrag()
+            }
+    }
+
+    private func updateDrag(translation: CGFloat) {
+        guard let drag else { return }
+        let span = drag.span(at: Double(translation), duration: duration)
+        guard span != region.span else { return }
+        edits.updateSpan(kind: kind, id: region.id, span: span, duration: duration)
+    }
+
+    private func finishDrag() {
+        guard drag != nil else { return }
+        edits.endUndoTransaction()
+        drag = nil
+    }
+
+    private func performPrimaryEdit() {
+        switch kind {
+        case .zoom: edits.deepenZoom(id: region.id)
+        case .trim, .annotation: break
+        }
+    }
+
+    private func x(for time: Double) -> CGFloat {
+        viewport.x(for: time, width: width, clamped: true) ?? 0
+    }
+
+    private var regionAccessibilityValue: String {
+        "\(region.label), \(region.span.start.formatted(.number.precision(.fractionLength(1)))) to \(region.span.end.formatted(.number.precision(.fractionLength(1)))) seconds"
+    }
+
+    private var regionAccessibilityHint: String {
+        kind == .zoom ? "Command-click to toggle selection. Shift-click to select a range. Press Delete to remove selected zooms. Press twice to increase zoom depth." : "Selects this timeline region."
+    }
+}

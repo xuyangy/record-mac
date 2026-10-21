@@ -1,0 +1,853 @@
+import AVFoundation
+import AppKit
+import CoreGraphics
+import SwiftUI
+import UniformTypeIdentifiers
+
+struct StudioWindowView: View {
+    @EnvironmentObject private var model: AppModel
+    @Environment(\.dismissWindow) private var dismissWindow
+    var editorSession: EditorSession?
+
+    var body: some View {
+        let workspace = model.appShell.workspace(for: editorSession)
+        StudioShell(editorSession: editorSession, workspace: workspace)
+            .alert("Couldn’t Save Changes", isPresented: workspace.autosaveRecoveryBinding) {
+                Button("Retry and Close") {
+                    Task {
+                        guard await workspace.retryPendingAutosaves() else { return }
+                        let outcome = await model.appShell.closeWorkspace(for: editorSession)
+                        if outcome == .autosaveFailed {
+                            model.appShell.activateWorkspace(for: editorSession)
+                        }
+                        guard outcome == .closed else { return }
+                        dismissEditorWindow()
+                    }
+                }
+                Button("Close Without Saving", role: .destructive) {
+                    guard model.appShell.discardWorkspace(for: editorSession) else { return }
+                    dismissEditorWindow()
+                }
+                .disabled(!workspace.canAbandonPendingAutosaves)
+                Button("Keep Editing", role: .cancel) {}
+            } message: {
+                Text(autosaveRecoveryMessage(for: workspace))
+            }
+            .background {
+                StudioWindowCloseInterceptor {
+                    guard let request = model.appShell.beginClosingWorkspace(for: editorSession) else {
+                        return true
+                    }
+                    let outcome = await model.appShell.finishClosingWorkspace(request)
+                    if outcome == .autosaveFailed {
+                        model.appShell.activateWorkspace(for: editorSession)
+                    }
+                    return outcome == .closed
+                }
+                .frame(width: 0, height: 0)
+            }
+            .onAppear {
+                model.appShell.activateWorkspace(for: editorSession)
+                if editorSession == nil, model.selectedSection == .capture {
+                    model.selectedSection = .editor
+                }
+            }
+            .task(id: workspace.state.statusSeverity) {
+                guard workspace.state.statusSeverity == .failure else { return }
+                do {
+                    try await Task.sleep(nanoseconds: 150_000_000)
+                } catch {
+                    return
+                }
+                guard !Task.isCancelled,
+                      !workspace.state.isAutosaveRecoveryPresented else {
+                    return
+                }
+                announceAutosaveFailure(workspace.state.autosaveFailureMessage)
+            }
+    }
+
+    private func dismissEditorWindow() {
+        if let editorSession {
+            dismissWindow(id: "editor", value: editorSession)
+        } else {
+            dismissWindow(id: "studio")
+        }
+    }
+
+    private func autosaveRecoveryMessage(for workspace: EditorWorkspaceDriver) -> String {
+        let reason = workspace.state.autosaveFailureMessage
+            ?? "Open Recorder couldn’t save the latest changes."
+        if workspace.canAbandonPendingAutosaves {
+            return "Your latest edits haven’t been saved to disk. \(reason) Retry, keep editing, or close and discard them."
+        }
+        return "Your latest edits haven’t been saved to disk. \(reason) Keep editing while the current save finishes, or retry and close afterward."
+    }
+
+    private func announceAutosaveFailure(_ message: String?) {
+        guard let message else { return }
+        let element: Any
+        if let keyWindow = NSApp.keyWindow {
+            element = keyWindow
+        } else {
+            element = NSApplication.shared
+        }
+        NSAccessibility.post(
+            element: element,
+            notification: .announcementRequested,
+            userInfo: [
+                .announcement: "Save failed. \(message)",
+                .priority: NSAccessibilityPriorityLevel.high.rawValue
+            ]
+        )
+    }
+}
+
+
+struct StudioShell: View {
+    @EnvironmentObject private var model: AppModel
+    var editorSession: EditorSession?
+    var workspace: EditorWorkspaceDriver
+
+    var body: some View {
+        VStack(spacing: 0) {
+            StudioTitleBar(
+                editorSession: editorSession,
+                workspace: workspace
+            )
+            if let failureMessage = workspace.state.autosaveFailureMessage {
+                WorkspaceAutosaveFailureBanner(
+                    message: failureMessage,
+                    isRetrying: workspace.state.isAutosaveRetryInProgress
+                ) {
+                    Task {
+                        await workspace.retryPendingAutosavesKeepingWindowOpen()
+                    }
+                }
+            }
+            detailView
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Theme.appBg)
+        .sheet(isPresented: workspace.shortcutsHelpBinding) {
+            EditorShortcutsHelpDialog(isPresented: workspace.shortcutsHelpBinding)
+        }
+        .background {
+            StudioKeyDownMonitor { event in
+                handleShellShortcut(event)
+            }
+            .frame(width: 0, height: 0)
+        }
+        .onAppear {
+            if editorSession == nil {
+                if model.selectedSection == .capture {
+                    workspace.send(.sectionSelected(.editor))
+                } else {
+                    workspace.send(.appSectionSynced(model.selectedSection))
+                }
+            }
+        }
+        .onChange(of: model.selectedSection) { _, section in
+            if editorSession == nil {
+                workspace.send(.appSectionSynced(section))
+            }
+        }
+    }
+
+    private func handleShellShortcut(_ event: NSEvent) -> Bool {
+        guard !event.isARepeat else { return false }
+        guard event.modifierFlags.contains(.command),
+              event.modifierFlags.intersection([.control, .option]).isEmpty else {
+            return false
+        }
+
+        let key = (event.charactersIgnoringModifiers ?? event.characters ?? "").lowercased()
+        if key == "k" {
+            workspace.send(.shortcutsHelpToggled)
+            return true
+        }
+
+        if key == "z", !isTextInputActive {
+            if event.modifierFlags.contains(.shift) {
+                return workspace.redoActiveEditor(kind: activeEditorMediaKind)
+            }
+            return workspace.undoActiveEditor(kind: activeEditorMediaKind)
+        }
+
+        return false
+    }
+
+    @ViewBuilder
+    private var detailView: some View {
+        switch workspace.state.selectedSection {
+        case .capture:
+            EditorStudioView(editorSession: editorSession, workspace: workspace)
+        case .projects:
+            ProjectsStudioView()
+        case .editor:
+            EditorStudioView(editorSession: editorSession, workspace: workspace)
+        case .settings:
+            SettingsStudioView(
+                driver: model.appShell.settings,
+                serviceHealth: model.serviceHealth,
+                paths: model.paths
+            )
+        }
+    }
+
+    private var activeEditorMediaKind: EditorMediaKind? {
+        if let editorSession {
+            return editorSession.kind
+        }
+        if model.currentVideoURL != nil {
+            return .video
+        }
+        if model.currentScreenshotURL != nil {
+            return .screenshot
+        }
+        return nil
+    }
+
+    private var isTextInputActive: Bool {
+        guard let responder = NSApp.keyWindow?.firstResponder else { return false }
+        return responder is NSTextView || responder is NSTextField
+    }
+}
+
+private struct WorkspaceAutosaveFailureBanner: View {
+    var message: String
+    var isRetrying: Bool
+    var retry: () -> Void
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(Color.red)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Changes not saved")
+                    .font(.system(size: 12, weight: .semibold))
+                Text(message)
+                    .font(.system(size: 11))
+                    .foregroundStyle(Color.secondary)
+                    .lineLimit(2)
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("Changes not saved. \(message)")
+
+            Spacer(minLength: 12)
+
+            StudioButton(hitTarget: .rectangle, action: retry) {
+                HStack(spacing: 6) {
+                    if isRetrying {
+                        ProgressView()
+                            .controlSize(.mini)
+                    } else {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    Text(isRetrying ? "Retrying…" : "Retry Save")
+                }
+                    .font(.system(size: 11, weight: .semibold))
+                    .padding(.horizontal, 10)
+                    .frame(height: 28)
+                    .background(Theme.overlayStrong, in: Rectangle())
+            }
+            .disabled(isRetrying)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(Color.red.opacity(0.08))
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(Color.red.opacity(0.28))
+                .frame(height: 1)
+        }
+    }
+}
+
+struct StudioNavBar: View {
+    var selectedSection: AppSection
+    var isScreenshotEditor: Bool
+    var onSelectSection: (AppSection) -> Void
+
+    private let items: [AppSection] = [.projects]
+
+    var body: some View {
+        HStack(spacing: 6) {
+            ForEach(items) { section in
+                StudioIconNavButton(
+                    title: section.title,
+                    symbolName: navSymbol(for: section)
+                ) {
+                    onSelectSection(section)
+                }
+            }
+        }
+        .frame(height: 32)
+    }
+
+    private func navSymbol(for section: AppSection) -> String {
+        switch section {
+        case .editor: isScreenshotEditor ? "photo.fill" : "video.fill"
+        case .projects: "folder.fill"
+        case .capture: "record.circle"
+        case .settings: "gearshape.fill"
+        }
+    }
+}
+
+struct StudioNavButton: View {
+    var title: String
+    var symbolName: String
+    var isActive: Bool
+    var action: () -> Void
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: symbolName)
+                .font(.system(size: 13, weight: isActive ? .bold : .medium))
+                .frame(width: 26, height: 26)
+                .foregroundStyle(isActive ? Color.white : (isHovering ? Color.white : Theme.fgMuted))
+                .animation(.snappy(duration: 0.16), value: isHovering)
+                .animation(.snappy(duration: 0.18), value: isActive)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(title)
+        .accessibilityLabel(title)
+        .onHover { hovering in
+            isHovering = hovering
+        }
+    }
+}
+
+struct StudioIconNavButton: View {
+    var title: String
+    var symbolName: String
+    var action: () -> Void
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: symbolName)
+                .font(.system(size: 11, weight: .bold))
+                .foregroundStyle(isHovering ? Color.white : Theme.fgMuted)
+                .frame(width: 26, height: 26)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(title)
+        .onHover { hovering in
+            isHovering = hovering
+        }
+    }
+}
+
+struct EditorHistoryButton: View {
+    var title: String
+    var symbolName: String
+    var isEnabled: Bool
+    var action: () -> Void
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: symbolName)
+                .font(.system(size: 12.5, weight: .semibold))
+                .frame(width: 26, height: 26)
+                .foregroundStyle(
+                    isEnabled
+                        ? (isHovering ? Color.white : Theme.fgMuted)
+                        : Theme.fgDisabled
+                )
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!isEnabled)
+        .help(title)
+        .accessibilityLabel(title)
+        .onHover { hovering in
+            isHovering = hovering
+        }
+    }
+}
+
+struct StudioTitleBar: View {
+    @EnvironmentObject private var model: AppModel
+    var editorSession: EditorSession?
+    var workspace: EditorWorkspaceDriver
+    @State private var isTitleHovered = false
+    @State private var projectPresetStore = ProjectPresetStore()
+    @State private var savedProjectPresets: [ProjectPreset] = []
+    @State private var isSavingProjectPreset = false
+    @State private var projectPresetName = ""
+
+    var body: some View {
+        ZStack {
+            HStack(spacing: 12) {
+                Spacer(minLength: 0)
+
+                HStack(spacing: 8) {
+                    StudioNavBar(
+                        selectedSection: workspace.state.selectedSection,
+                        isScreenshotEditor: editorMediaKind == .screenshot,
+                        onSelectSection: { section in
+                            workspace.send(.sectionSelected(section))
+                        }
+                    )
+
+                    editorHistoryControls
+                    exportButton
+                }
+            }
+
+            titleLabel
+                .frame(maxWidth: 520)
+                .padding(.horizontal, 190)
+        }
+        .frame(height: 52)
+        .padding(.horizontal, 12)
+        .background {
+            ZStack {
+                Rectangle()
+                    .fill(.ultraThinMaterial)
+                Rectangle()
+                    .fill(Theme.navbarBg.opacity(0.92))
+                LinearGradient(
+                    colors: [Color.white.opacity(0.045), Color.clear],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+            }
+        }
+        .simultaneousGesture(
+            TapGesture().onEnded {
+                workspace.send(.timelineSelectionClearRequested)
+            }
+        )
+        .onAppear { savedProjectPresets = projectPresetStore.load() }
+        .alert("Save Project Preset", isPresented: $isSavingProjectPreset) {
+            TextField("Preset name", text: $projectPresetName)
+            Button("Save") { saveProjectPreset() }
+                .disabled(projectPresetName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Save the current video appearance and audio settings for reuse.")
+        }
+    }
+
+    @ViewBuilder
+    private var editorHistoryControls: some View {
+        if workspace.state.selectedSection == .editor, editorMediaKind != nil {
+            HStack(spacing: 2) {
+                EditorHistoryButton(title: "Undo", symbolName: "arrow.uturn.backward", isEnabled: canUndo) {
+                    workspace.undoActiveEditor(kind: editorMediaKind)
+                }
+                EditorHistoryButton(title: "Redo", symbolName: "arrow.uturn.forward", isEnabled: canRedo) {
+                    workspace.redoActiveEditor(kind: editorMediaKind)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var exportButton: some View {
+        if workspace.state.selectedSection == .editor, let videoURL {
+            HStack(spacing: 6) {
+                StudioIconNavButton(title: "Keyboard Shortcuts", symbolName: "questionmark") {
+                    workspace.send(.shortcutsHelpToggled)
+                }
+
+                projectPresetsMenu
+
+                Menu {
+                    Button("16:9 Widescreen (YouTube, Desktop)") {
+                        workspace.video.send(.previewAspectChanged(.wide))
+                    }
+                    Button("9:16 Vertical (Reels, TikTok, Shorts)") {
+                        workspace.video.send(.previewAspectChanged(.vertical))
+                    }
+                    Button("1:1 Square (Instagram, Feed)") {
+                        workspace.video.send(.previewAspectChanged(.square))
+                    }
+                    Button("4:5 Portrait (Social Post)") {
+                        workspace.video.send(.previewAspectChanged(.portrait))
+                    }
+                    Button("4:3 Classic") {
+                        workspace.video.send(.previewAspectChanged(.classic))
+                    }
+                    Divider()
+                    Button("Source Aspect (Auto)") {
+                        workspace.video.send(.previewAspectChanged(.auto))
+                    }
+                } label: {
+                    Image(systemName: "aspectratio")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(Theme.fg)
+                        .frame(width: 28, height: 28)
+                        .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .help("Presets")
+
+                StudioButton(hitTarget: .rounded(6)) {
+                    workspace.send(.videoExportRequested(videoURL, editorSessionID: editorSession?.id))
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: "arrow.up.right.video.fill")
+                            .font(.system(size: 10.5, weight: .bold))
+                        Text("Export")
+                            .font(.system(size: 11.5, weight: .bold))
+                    }
+                    .padding(.horizontal, 10)
+                    .frame(height: 28)
+                    .background(Color.white, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    .foregroundStyle(Color.black)
+                    .shadow(color: Color.black.opacity(0.25), radius: 3, y: 1)
+                }
+            }
+        } else if workspace.state.selectedSection == .editor, screenshotURL != nil {
+            HStack(spacing: 6) {
+                StudioIconNavButton(title: "Keyboard Shortcuts", symbolName: "questionmark") {
+                    workspace.send(.shortcutsHelpToggled)
+                }
+
+                StudioButton(hitTarget: .rounded(6)) {
+                    workspace.send(.screenshotExportRequested(screenshotURL, editorSessionID: editorSession?.id))
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: "square.and.arrow.up.fill")
+                            .font(.system(size: 10.5, weight: .bold))
+                        Text("Export")
+                            .font(.system(size: 11.5, weight: .bold))
+                    }
+                    .padding(.horizontal, 10)
+                    .frame(height: 28)
+                    .background(Color.white, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    .foregroundStyle(Color.black)
+                    .shadow(color: Color.black.opacity(0.25), radius: 3, y: 1)
+                }
+            }
+        }
+    }
+
+    private var projectPresetsMenu: some View {
+        Menu {
+            if savedProjectPresets.isEmpty {
+                Text("No saved presets")
+            } else {
+                ForEach(savedProjectPresets) { preset in
+                    Menu(preset.name) {
+                        Button("Apply") { applyProjectPreset(preset) }
+                        Button("Delete Preset", role: .destructive) {
+                            projectPresetStore.delete(id: preset.id)
+                            savedProjectPresets = projectPresetStore.load()
+                        }
+                    }
+                }
+            }
+            Divider()
+            Button("Save Current Settings…") {
+                projectPresetName = ""
+                isSavingProjectPreset = true
+            }
+        } label: {
+            Label("Project Presets", systemImage: "square.stack.3d.up")
+                .font(.system(size: 11.5, weight: .semibold))
+                .foregroundStyle(Theme.fg)
+                .padding(.horizontal, 8)
+                .frame(height: 28)
+                .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .help("Save or apply project appearance and audio presets")
+    }
+
+    private func saveProjectPreset() {
+        let name = projectPresetName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return }
+        projectPresetStore.save(ProjectPreset(
+            name: name,
+            video: workspace.video.state.video,
+            audio: workspace.timeline.snapshot.audio
+        ))
+        savedProjectPresets = projectPresetStore.load()
+    }
+
+    private func applyProjectPreset(_ preset: ProjectPreset) {
+        workspace.video.send(.videoStateChanged(preset.video))
+        var snapshot = workspace.timeline.snapshot
+        snapshot.audio = preset.audio
+        workspace.timeline.applySnapshot(snapshot)
+    }
+
+    private var canUndo: Bool {
+        workspace.canUndo(kind: editorMediaKind)
+    }
+
+    private var canRedo: Bool {
+        workspace.canRedo(kind: editorMediaKind)
+    }
+
+    private var titleLabel: some View {
+        HStack(spacing: 6) {
+            if workspace.state.selectedSection == .editor, let editorMediaKind {
+                Image(systemName: editorMediaKind.titleIconSystemName)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Theme.fgMuted.opacity(0.55))
+                    .accessibilityHidden(true)
+            }
+            Text(title)
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(isTitleHovered ? Color.white : Theme.fgMuted.opacity(0.65))
+                .lineLimit(1)
+                .truncationMode(.middle)
+            workspaceStatusIndicator
+        }
+        .frame(maxWidth: .infinity, alignment: .center)
+        .contentShape(Rectangle())
+        .onHover { isTitleHovered = $0 }
+    }
+
+    @ViewBuilder
+    private var workspaceStatusIndicator: some View {
+        Group {
+            switch workspace.state.statusSeverity {
+            case .none:
+                Color.clear
+                    .accessibilityHidden(true)
+            case .informational:
+                Image(systemName: "info.circle")
+                    .foregroundStyle(Color.secondary)
+                    .accessibilityLabel("Editor status: \(workspace.state.statusMessage)")
+                    .help(workspace.state.statusMessage)
+            case .progress:
+                ProgressView()
+                    .controlSize(.mini)
+                    .accessibilityLabel(workspace.state.statusMessage)
+                    .help(workspace.state.statusMessage)
+            case .success:
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundStyle(Color.green)
+                    .accessibilityLabel("Editor status: \(workspace.state.statusMessage)")
+                    .help(workspace.state.statusMessage)
+        case .failure:
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(Color.red)
+                .accessibilityLabel(
+                    "Editor error: \(workspace.state.statusMessage). "
+                        + (workspace.state.autosaveFailureMessage ?? "")
+                )
+                .help(workspace.state.autosaveFailureMessage ?? workspace.state.statusMessage)
+            }
+        }
+        .frame(width: 18, height: 18)
+    }
+
+    private var title: String {
+        switch workspace.state.selectedSection {
+        case .capture:
+            "Capture"
+        case .projects:
+            "Projects"
+        case .settings:
+            "Settings"
+        case .editor:
+            if let editorSession {
+                editorWindowTitle(
+                    displayTitle: editorSession.displayTitle,
+                    projectPath: editorSession.projectPath
+                )
+            } else if let currentVideoURL = model.currentVideoURL {
+                editorWindowTitle(
+                    displayTitle: EditorMediaKind.video.displayTitle(for: currentVideoURL),
+                    projectPath: matchingLastSessionProjectPath(kind: .video, url: currentVideoURL)
+                )
+            } else if let currentScreenshotURL = model.currentScreenshotURL {
+                editorWindowTitle(
+                    displayTitle: EditorMediaKind.screenshot.displayTitle(for: currentScreenshotURL),
+                    projectPath: matchingLastSessionProjectPath(kind: .screenshot, url: currentScreenshotURL)
+                )
+            } else {
+                "Open Recorder Editor"
+            }
+        }
+    }
+
+    private func matchingLastSessionProjectPath(kind: EditorMediaKind, url: URL) -> String? {
+        guard let session = model.lastEditorSession,
+              session.kind == kind,
+              session.url.standardizedFileURL == url.standardizedFileURL else {
+            return nil
+        }
+        return session.projectPath
+    }
+
+    private var editorMediaKind: EditorMediaKind? {
+        if let editorSession {
+            return editorSession.kind
+        }
+        if model.currentVideoURL != nil {
+            return .video
+        }
+        if model.currentScreenshotURL != nil {
+            return .screenshot
+        }
+        return nil
+    }
+
+    private var videoURL: URL? {
+        if let editorSession {
+            return editorSession.kind == .video ? editorSession.url : nil
+        }
+        return model.currentVideoURL
+    }
+
+    private var screenshotURL: URL? {
+        if let editorSession {
+            return editorSession.kind == .screenshot ? editorSession.url : nil
+        }
+        return model.currentScreenshotURL
+    }
+}
+
+func editorWindowTitle(displayTitle: String, projectPath: String?) -> String {
+    guard projectPath != nil else { return displayTitle }
+    return displayTitle.hasSuffix(".openrecorder") ? displayTitle : "\(displayTitle).openrecorder"
+}
+
+struct EditorShortcutsHelpDialog: View {
+    @Binding var isPresented: Bool
+
+    private let shortcuts: [EditorShortcutHelpItem] = [
+        EditorShortcutHelpItem(keys: "Space", action: "Play or pause preview"),
+        EditorShortcutHelpItem(keys: "Z", action: "Add zoom section at playhead"),
+        EditorShortcutHelpItem(keys: "S", action: "Cycle selected clip speed"),
+        EditorShortcutHelpItem(keys: "T", action: "Split clip at playhead"),
+        EditorShortcutHelpItem(keys: "Cmd Z", action: "Undo editor change"),
+        EditorShortcutHelpItem(keys: "Cmd Shift Z", action: "Redo editor change"),
+        EditorShortcutHelpItem(keys: "Cmd K", action: "Toggle shortcuts")
+    ]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            HStack(spacing: 12) {
+                Image(systemName: "command")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(Theme.accent)
+                    .frame(width: 32, height: 32)
+                    .background(Theme.accent.opacity(0.14), in: RoundedRectangle(cornerRadius: Theme.radiusSm, style: .continuous))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: Theme.radiusSm, style: .continuous)
+                            .stroke(Theme.accent.opacity(0.3), lineWidth: 1)
+                    }
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Keyboard Shortcuts")
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(Color.white)
+                    Text("Speed up your workflow with hotkeys.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Theme.fgMuted)
+                }
+
+                Spacer(minLength: 0)
+
+                StudioButton(hitTarget: .rounded(Theme.radiusSm), help: "Close") {
+                    isPresented = false
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 11, weight: .bold))
+                        .frame(width: 28, height: 28)
+                        .foregroundStyle(Theme.fgMuted)
+                        .background(Theme.overlay, in: RoundedRectangle(cornerRadius: Theme.radiusSm, style: .continuous))
+                        .overlay {
+                            RoundedRectangle(cornerRadius: Theme.radiusSm, style: .continuous)
+                                .stroke(Theme.borderSubtle, lineWidth: 1)
+                        }
+                }
+            }
+
+            VStack(spacing: 0) {
+                ForEach(shortcuts) { shortcut in
+                    HStack(spacing: 14) {
+                        Text(shortcut.keys)
+                            .font(.system(size: 11, weight: .bold, design: .monospaced))
+                            .foregroundStyle(Color.white)
+                            .padding(.horizontal, 10)
+                            .frame(height: 26)
+                            .background(Theme.overlayStrong, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                            .overlay {
+                                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                    .stroke(Theme.borderStrong.opacity(0.7), lineWidth: 1)
+                            }
+                            .shadow(color: Color.black.opacity(0.2), radius: 2, y: 1)
+
+                        Text(shortcut.action)
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(Theme.fg)
+
+                        Spacer(minLength: 0)
+                    }
+                    .padding(.vertical, 8)
+
+                    if shortcut.id != shortcuts.last?.id {
+                        Rectangle()
+                            .fill(Theme.borderSubtle.opacity(0.7))
+                            .frame(height: 1)
+                    }
+                }
+            }
+        }
+        .padding(20)
+        .frame(width: 440)
+        .background {
+            ZStack {
+                Rectangle()
+                    .fill(.ultraThinMaterial)
+                Rectangle()
+                    .fill(Theme.surface.opacity(0.96))
+                LinearGradient(
+                    colors: [Color.white.opacity(0.04), Color.clear],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+            }
+        }
+        .background {
+            StudioKeyDownMonitor { event in
+                handleShortcut(event)
+            }
+            .frame(width: 0, height: 0)
+        }
+    }
+
+    private func handleShortcut(_ event: NSEvent) -> Bool {
+        guard !event.isARepeat else { return false }
+        let key = (event.charactersIgnoringModifiers ?? event.characters ?? "").lowercased()
+
+        if key == "\u{1b}" {
+            isPresented = false
+            return true
+        }
+
+        guard event.modifierFlags.contains(.command),
+              event.modifierFlags.intersection([.control, .option]).isEmpty,
+              key == "k" else {
+            return false
+        }
+
+        isPresented.toggle()
+        return true
+    }
+}
+
+struct EditorShortcutHelpItem: Identifiable {
+    var keys: String
+    var action: String
+
+    var id: String { keys }
+}

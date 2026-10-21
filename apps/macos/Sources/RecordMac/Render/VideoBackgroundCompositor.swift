@@ -1,0 +1,1114 @@
+import AVFoundation
+import AppKit
+import CoreImage
+import CoreMedia
+import CoreText
+import CoreVideo
+import Foundation
+import Metal
+
+struct VideoInsetBalance: Equatable, Hashable, Codable {
+    var left: Double
+    var top: Double
+
+    static let centered = VideoInsetBalance(left: 0.5, top: 0.5)
+
+    var clamped: VideoInsetBalance {
+        VideoInsetBalance(
+            left: max(0, min(left, 1)),
+            top: max(0, min(top, 1))
+        )
+    }
+}
+
+struct VideoInsetStyling: Equatable {
+    var amountRatio: Double
+    var color: SerializableColor
+    var opacity: Double
+    var balance: VideoInsetBalance
+
+    static let none = VideoInsetStyling(
+        amountRatio: 0,
+        color: SerializableColor(hex: "#276FAA"),
+        opacity: 1,
+        balance: .centered
+    )
+
+    var isEnabled: Bool {
+        amountRatio > 0
+    }
+}
+
+struct VideoInsetLayout: Equatable {
+    var frameRect: CGRect
+    var contentRect: CGRect
+}
+
+enum VideoInsetGeometry {
+    static func amountRatio(fromValue value: Double) -> Double {
+        max(0, min(value, 100)) / 100 * 0.5
+    }
+
+    static func layout(in frameRect: CGRect, amountRatio: Double, balance: VideoInsetBalance) -> VideoInsetLayout {
+        let contentRect = contentRect(in: frameRect, amountRatio: amountRatio, balance: balance)
+        guard contentRect != .zero else {
+            return VideoInsetLayout(frameRect: .zero, contentRect: .zero)
+        }
+
+        return VideoInsetLayout(frameRect: frameRect, contentRect: contentRect)
+    }
+
+    static func contentRect(in frameRect: CGRect, amountRatio: Double, balance: VideoInsetBalance) -> CGRect {
+        guard frameRect.width.isFinite,
+              frameRect.height.isFinite,
+              frameRect.width > 0,
+              frameRect.height > 0 else {
+            return .zero
+        }
+
+        let scale = max(0.05, 1 - max(0, min(amountRatio, 0.95)))
+        let contentSize = CGSize(width: frameRect.width * scale, height: frameRect.height * scale)
+        let freeX = max(0, frameRect.width - contentSize.width)
+        let freeY = max(0, frameRect.height - contentSize.height)
+        let resolvedBalance = balance.clamped
+
+        return CGRect(
+            x: frameRect.minX + freeX * resolvedBalance.left,
+            y: frameRect.minY + freeY * resolvedBalance.top,
+            width: contentSize.width,
+            height: contentSize.height
+        )
+    }
+}
+
+struct VideoBackgroundStyling: Equatable {
+    var background: BackgroundStyle
+    var paddingRatio: Double
+    var borderRadiusRatio: Double
+    var shadowIntensity: Double
+    var backgroundBlurRatio: Double
+    var inset: VideoInsetStyling
+
+    static let none = VideoBackgroundStyling(
+        background: .transparent,
+        paddingRatio: 0,
+        borderRadiusRatio: 0,
+        shadowIntensity: 0,
+        backgroundBlurRatio: 0,
+        inset: .none
+    )
+
+    var isPassthrough: Bool {
+        background.isTransparent &&
+            paddingRatio == 0 &&
+            borderRadiusRatio == 0 &&
+            shadowIntensity == 0 &&
+            backgroundBlurRatio == 0 &&
+            !inset.isEnabled
+    }
+}
+
+final class VideoBackgroundCompositionInstruction: NSObject, AVVideoCompositionInstructionProtocol, @unchecked Sendable {
+    var diagnostics: VideoExportDiagnostics?
+    let timeRange: CMTimeRange
+    let enablePostProcessing: Bool = false
+    let containsTweening: Bool = true
+    let requiredSourceTrackIDs: [NSValue]?
+    let passthroughTrackID: CMPersistentTrackID = kCMPersistentTrackID_Invalid
+
+    let sourceTrackID: CMPersistentTrackID
+    let facecamTrackID: CMPersistentTrackID?
+    let cameraLayoutEnabled: Bool
+    let cameraPresentation: CameraLayoutPresentation?
+    let scene: SceneSettings
+    let styling: VideoBackgroundStyling
+    let preferredTransform: CGAffineTransform
+    let normalizedSize: CGSize
+    let facecamPreferredTransform: CGAffineTransform
+    let facecamNormalizedSize: CGSize
+    let cropRect: CGRect
+    let renderSize: CGSize
+    let edits: TimelineEditSnapshot
+    let editPlan: TimelineExportEditPlan
+    let cursorTrack: CursorTelemetryTrack?
+    let cursorSettings: CursorOverlaySettings
+    let facecamFallbackSettings: FacecamSettings?
+
+    init(
+        timeRange: CMTimeRange,
+        trackID: CMPersistentTrackID,
+        facecamTrackID: CMPersistentTrackID? = nil,
+        styling: VideoBackgroundStyling,
+        scene: SceneSettings = .identity,
+        preferredTransform: CGAffineTransform,
+        normalizedSize: CGSize,
+        facecamPreferredTransform: CGAffineTransform = .identity,
+        facecamNormalizedSize: CGSize = .zero,
+        cropRect: CGRect,
+        renderSize: CGSize,
+        edits: TimelineEditSnapshot = .empty,
+        editPlan: TimelineExportEditPlan = TimelineExportEditPlan(segments: [], outputDuration: 0),
+        cursorTrack: CursorTelemetryTrack? = nil,
+        cursorSettings: CursorOverlaySettings = .hidden,
+        facecamFallbackSettings: FacecamSettings? = nil,
+        cameraLayoutEnabled: Bool? = nil,
+        cameraPresentation: CameraLayoutPresentation? = nil
+    ) {
+        self.timeRange = timeRange
+        self.sourceTrackID = trackID
+        self.facecamTrackID = facecamTrackID
+        self.cameraPresentation = cameraPresentation
+        self.cameraLayoutEnabled = cameraLayoutEnabled ?? (facecamTrackID != nil)
+        self.requiredSourceTrackIDs = ([trackID] + (facecamTrackID.map { [$0] } ?? [])).map { NSNumber(value: $0) }
+        self.scene = scene
+        self.styling = styling
+        self.preferredTransform = preferredTransform
+        self.normalizedSize = normalizedSize
+        self.facecamPreferredTransform = facecamPreferredTransform
+        self.facecamNormalizedSize = facecamNormalizedSize
+        self.cropRect = cropRect
+        self.renderSize = renderSize
+        self.edits = edits
+        self.editPlan = editPlan
+        self.cursorTrack = cursorTrack
+        self.cursorSettings = cursorSettings.clamped
+        self.facecamFallbackSettings = facecamFallbackSettings?.clamped
+        super.init()
+    }
+}
+
+enum VideoCompositorError: LocalizedError {
+    case missingInstruction
+    case missingSourceFrame
+    case renderBufferUnavailable
+    case renderFailed
+
+    var errorDescription: String? {
+        switch self {
+        case .missingInstruction: "Custom video instruction is missing."
+        case .missingSourceFrame: "Source video frame is unavailable."
+        case .renderBufferUnavailable: "Could not allocate render buffer."
+        case .renderFailed: "Failed to render frame."
+        }
+    }
+}
+
+private struct CursorGlyphImage {
+    var image: CIImage
+    var tipOffset: CGPoint
+}
+
+private struct CursorGlyphCacheKey: Hashable {
+    var styleID: CursorStyleID
+    var sizeKey: Int
+}
+
+typealias VideoCompositorPixelBufferAttributes = [String: any Sendable]
+
+final class VideoBackgroundCompositor: NSObject, AVVideoCompositing, @unchecked Sendable {
+    private let renderingQueueKey = DispatchSpecificKey<Bool>()
+    private let renderingQueue = DispatchQueue(label: "com.openrecorder.video.compositor", qos: .userInitiated)
+    private let ciContext: CIContext
+    private let backgroundCache: VideoStaticBackgroundCache
+    let roundedMaskCache = VideoRoundedMaskCache()
+    #if OPEN_RECORDER_TESTING
+    private let cacheMasks = ProcessInfo.processInfo.environment["OPEN_RECORDER_EXPORT_UNCACHED_MASKS"] != "1"
+    #else
+    private let cacheMasks = true
+    #endif
+    private var renderContext: AVVideoCompositionRenderContext?
+    private let renderContextLock = NSLock()
+    private let sceneRenderer = SceneRenderer()
+    private var annotationCache: [String: CIImage] = [:]
+    private var cursorGlyphCache: [CursorGlyphCacheKey: CursorGlyphImage] = [:]
+    private static let pixelBufferAttributes: VideoCompositorPixelBufferAttributes = [
+        kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
+        kCVPixelBufferIOSurfacePropertiesKey as String: VideoCompositorPixelBufferAttributes()
+    ]
+
+    nonisolated static func ciContextOptions() -> [CIContextOption: Any] {
+        [.cacheIntermediates: false]
+    }
+
+    override init() {
+        if let device = MTLCreateSystemDefaultDevice() {
+            ciContext = CIContext(mtlDevice: device, options: Self.ciContextOptions())
+        } else {
+            ciContext = CIContext(options: Self.ciContextOptions())
+        }
+        backgroundCache = VideoStaticBackgroundCache(context: ciContext)
+        super.init()
+        renderingQueue.setSpecific(key: renderingQueueKey, value: true)
+    }
+
+    var sourcePixelBufferAttributes: VideoCompositorPixelBufferAttributes? {
+        Self.pixelBufferAttributes
+    }
+
+    var requiredPixelBufferAttributesForRenderContext: VideoCompositorPixelBufferAttributes {
+        Self.pixelBufferAttributes
+    }
+
+    func renderContextChanged(_ newRenderContext: AVVideoCompositionRenderContext) {
+        renderContextLock.lock()
+        renderContext = newRenderContext
+        renderContextLock.unlock()
+        backgroundCache.invalidate()
+        roundedMaskCache.invalidate()
+    }
+
+    func startRequest(_ request: AVAsynchronousVideoCompositionRequest) {
+        let renderRequest: () -> Void = {
+            autoreleasepool {
+                // Backpressure is intentional: queued requests retain decoded pixel buffers.
+                // Finish each frame before AVFoundation can hand us an unbounded backlog.
+                self.finishRequest(request)
+            }
+        }
+
+        if DispatchQueue.getSpecific(key: renderingQueueKey) == true {
+            renderRequest()
+        } else {
+            renderingQueue.sync(execute: renderRequest)
+        }
+    }
+
+    private func finishRequest(_ request: AVAsynchronousVideoCompositionRequest) {
+        do {
+            let composedBuffer = try self.composeFrame(for: request)
+            request.finish(withComposedVideoFrame: composedBuffer)
+        } catch {
+            request.finish(with: error)
+        }
+    }
+
+    func cancelAllPendingVideoCompositionRequests() {
+        defer {
+            backgroundCache.invalidate()
+            roundedMaskCache.invalidate()
+        }
+        if DispatchQueue.getSpecific(key: renderingQueueKey) == true {
+            return
+        }
+        renderingQueue.sync {}
+    }
+
+    private func composeFrame(for request: AVAsynchronousVideoCompositionRequest) throws -> CVPixelBuffer {
+        guard let instruction = request.videoCompositionInstruction as? VideoBackgroundCompositionInstruction else {
+            throw VideoCompositorError.missingInstruction
+        }
+
+        guard let sourceBuffer = request.sourceFrame(byTrackID: instruction.sourceTrackID) else {
+            throw VideoCompositorError.missingSourceFrame
+        }
+
+        guard let outputBuffer = request.renderContext.newPixelBuffer() else {
+            throw VideoCompositorError.renderBufferUnavailable
+        }
+
+        let preparationStart = instruction.diagnostics?.detailed == true ? CACurrentMediaTime() : 0
+        let composedImage = try makeComposedImage(
+            source: sourceBuffer,
+            facecam: instruction.facecamTrackID.flatMap { request.sourceFrame(byTrackID: $0) },
+            instruction: instruction,
+            compositionTime: request.compositionTime.seconds
+        )
+
+        if let diagnostics = instruction.diagnostics, diagnostics.detailed {
+            let preparationSeconds = CACurrentMediaTime() - preparationStart
+            let destination = CIRenderDestination(pixelBuffer: outputBuffer)
+            destination.colorSpace = CGColorSpace(name: CGColorSpace.sRGB)
+            let task = try ciContext.startTask(toRender: composedImage, to: destination)
+            let info = try task.waitUntilCompleted()
+            diagnostics.record(preparationSeconds: preparationSeconds, info: info)
+        } else {
+            ciContext.render(
+                composedImage, to: outputBuffer,
+                bounds: CGRect(origin: .zero, size: instruction.renderSize),
+                colorSpace: CGColorSpace(name: CGColorSpace.sRGB)
+            )
+            instruction.diagnostics?.record()
+        }
+
+        instruction.diagnostics?.frameObserver?(outputBuffer, request.compositionTime.seconds)
+        return outputBuffer
+    }
+
+    func makeComposedImage(
+        source: CVPixelBuffer,
+        facecam: CVPixelBuffer?,
+        instruction: VideoBackgroundCompositionInstruction,
+        compositionTime: Double
+    ) throws -> CIImage {
+        let renderSize = instruction.renderSize
+        let renderRect = CGRect(origin: .zero, size: renderSize)
+        let sourceTime = instruction.editPlan.sourceTime(forOutputTime: compositionTime) ?? compositionTime
+        if instruction.cameraLayoutEnabled {
+            let presentation = cameraPresentation(for: instruction, time: compositionTime)
+            // Use the same screen surface before, during and after a layout change.
+            // Switching render paths here used to reframe an already-running zoom.
+            return try makeCameraLayoutImage(source: source, facecam: facecam, instruction: instruction,
+                                             compositionTime: compositionTime, presentation: presentation)
+        }
+
+        var sourceImage = CIImage(cvPixelBuffer: source)
+        sourceImage = sourceImage.transformed(by: instruction.preferredTransform)
+        let cropRect = Self.coreImageCropRect(
+            fromTopLeftRect: instruction.cropRect,
+            sourceSize: instruction.normalizedSize
+        )
+        sourceImage = sourceImage
+            .cropped(to: cropRect)
+            .transformed(by: CGAffineTransform(translationX: -cropRect.minX, y: -cropRect.minY))
+
+        let minDim = min(renderSize.width, renderSize.height)
+        let pad = instruction.styling.paddingRatio * minDim
+        let innerSize = CGSize(
+            width: max(2, renderSize.width - 2 * pad),
+            height: max(2, renderSize.height - 2 * pad)
+        )
+        let innerRect = CGRect(
+            x: (renderSize.width - innerSize.width) / 2,
+            y: (renderSize.height - innerSize.height) / 2,
+            width: innerSize.width,
+            height: innerSize.height
+        )
+
+        let sourceSize = instruction.cropRect.size
+        let frameScale = min(innerSize.width / max(sourceSize.width, 1), innerSize.height / max(sourceSize.height, 1))
+        let frameSize = CGSize(width: sourceSize.width * frameScale, height: sourceSize.height * frameScale)
+        let frameRect = CGRect(
+            x: innerRect.midX - frameSize.width / 2,
+            y: innerRect.midY - frameSize.height / 2,
+            width: frameSize.width,
+            height: frameSize.height
+        )
+        let sourceLayout = sourceLayout(frameRect: frameRect, styling: instruction.styling)
+        let contentRect = sourceLayout.contentRect
+        let scale = min(contentRect.width / max(sourceSize.width, 1), contentRect.height / max(sourceSize.height, 1))
+        let scaledSize = CGSize(width: sourceSize.width * scale, height: sourceSize.height * scale)
+        let scaledImage = sourceImage.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        let scaledExtent = scaledImage.extent
+        let dx = contentRect.midX - scaledExtent.midX
+        let dy = contentRect.midY - scaledExtent.midY
+        let positionedImage = scaledImage.transformed(by: CGAffineTransform(translationX: dx, y: dy))
+
+        let placedRect = CGRect(
+            x: contentRect.midX - scaledSize.width / 2,
+            y: contentRect.midY - scaledSize.height / 2,
+            width: scaledSize.width,
+            height: scaledSize.height
+        )
+        let cornerRadius = instruction.cameraLayoutEnabled
+            ? cameraPresentation(for: instruction, time: compositionTime).screenRadius
+            : instruction.styling.borderRadiusRatio * minDim
+        let maskedSource = applyRoundedMask(positionedImage, cornerRadius: cornerRadius, in: placedRect, role: .recording)
+
+        let blurRadius = instruction.styling.backgroundBlurRatio * minDim
+        let background = backgroundCache.image(
+            style: instruction.styling.background,
+            extent: renderRect,
+            blurRadius: blurRadius
+        ) {
+            var image = makeBackground(instruction.styling.background, extent: renderRect)
+            if blurRadius > 0, !instruction.styling.background.isTransparent {
+                image = applyGaussianBlur(image, radius: blurRadius).cropped(to: renderRect)
+            }
+            return image
+        }
+
+        if instruction.scene.isActive {
+            // Scene zooms happen within the screen surface; the stage remains upright.
+            var media = maskedSource
+            if let cursor = makeCursorLayer(for: instruction, compositionTime: compositionTime, contentRect: contentRect) {
+                media = cursor.composited(over: media)
+            }
+            media = applyZoomTransform(to: media, renderRect: renderRect, instruction: instruction,
+                                       compositionTime: compositionTime, placedRect: placedRect).cropped(to: placedRect)
+            var surface = media
+            if instruction.styling.inset.isEnabled && instruction.styling.inset.opacity > 0 {
+                surface = media.composited(over: makeInsetLayer(for: instruction.styling.inset,
+                    in: sourceLayout.frameRect, cornerRadius: cornerRadius))
+            }
+            var result = sceneRenderer.render(media: surface, mediaRect: sourceLayout.frameRect,
+                frame: sourceLayout.frameRect, canvas: renderSize,
+                settings: instruction.scene.clamped(to: instruction.editPlan.outputDuration),
+                time: compositionTime, radius: cornerRadius, shadow: instruction.styling.shadowIntensity)
+                .composited(over: background)
+            // Canvas annotations and facecam are deliberately outside the tilted surface.
+            for annotation in instruction.edits.annotationRegions {
+                guard let span = instruction.editPlan.outputSpans(forSourceSpan: annotation.span).first(where: { $0.contains(compositionTime) }),
+                      let layer = annotationImage(annotation, canvasSize: renderSize) else { continue }
+                let progress = (compositionTime - span.start) / max(0.001, span.duration)
+                let opacity = min(1, min(progress / 0.08, (1 - progress) / 0.08))
+                let positioned = layer.transformed(by: CGAffineTransform(
+                    translationX: renderSize.width * annotation.x - layer.extent.width / 2,
+                    y: renderSize.height * (1 - annotation.y) - layer.extent.height / 2))
+                    .applyingFilter("CIColorMatrix", parameters: ["inputAVector": CIVector(x: 0, y: 0, z: 0, w: opacity)])
+                result = positioned.composited(over: result)
+            }
+            if var camera = makeFacecamLayer(facecam, for: instruction, compositionTime: compositionTime) {
+                let sourceTime = instruction.editPlan.sourceTime(forOutputTime: compositionTime) ?? compositionTime
+                let fixed = instruction.edits.activeCameraSettings(at: sourceTime,
+                    duration: instruction.editPlan.segments.last?.sourceEnd ?? 0,
+                    fallback: instruction.facecamFallbackSettings)?.fixedDuringZoom == true
+                if !fixed {
+                    camera = applyZoomTransform(to: camera, renderRect: renderRect, instruction: instruction,
+                        compositionTime: compositionTime, placedRect: placedRect)
+                }
+                result = camera.composited(over: result)
+            }
+            return result.cropped(to: renderRect)
+        }
+
+        var composed = background
+        let drawsInsetFill = instruction.styling.inset.isEnabled && instruction.styling.inset.opacity > 0
+        if instruction.styling.inset.isEnabled {
+            if instruction.styling.shadowIntensity > 0, drawsInsetFill {
+                let shadowMask = makeRoundedFill(
+                    color: CIColor.black,
+                    in: sourceLayout.frameRect,
+                    cornerRadius: cornerRadius
+                )
+                let shadow = makeShadow(
+                    shadowMask,
+                    intensity: instruction.styling.shadowIntensity,
+                    in: sourceLayout.frameRect
+                )
+                composed = shadow.composited(over: composed)
+            }
+            if drawsInsetFill {
+                let insetLayer = makeInsetLayer(
+                    for: instruction.styling.inset,
+                    in: sourceLayout.frameRect,
+                    cornerRadius: cornerRadius
+                )
+                composed = insetLayer.composited(over: composed)
+            }
+        }
+        if instruction.styling.shadowIntensity > 0 {
+            if !drawsInsetFill {
+                let shadow = makeShadow(maskedSource, intensity: instruction.styling.shadowIntensity, in: placedRect)
+                composed = shadow.composited(over: composed)
+            }
+        }
+        composed = maskedSource.composited(over: composed)
+        if let cursor = makeCursorLayer(for: instruction, compositionTime: compositionTime, contentRect: contentRect) {
+            composed = cursor.composited(over: composed)
+        }
+
+        composed = compositeAnnotations(over: composed, instruction: instruction, compositionTime: compositionTime)
+
+        // When fixedDuringZoom is false (default), composite the camera bubble before applying
+        // the zoom so it moves with the zoomed screen content.
+        let cameraIsFixed = instruction.edits.activeCameraSettings(at: sourceTime,
+            duration: instruction.editPlan.segments.last?.sourceEnd ?? instruction.timeRange.duration.seconds,
+            fallback: instruction.facecamFallbackSettings)?.fixedDuringZoom == true
+        if !cameraIsFixed,
+           let facecam = makeFacecamLayer(facecam, for: instruction, compositionTime: compositionTime) {
+            composed = facecam.composited(over: composed)
+        }
+
+        // Apply zoom transform for the non-passthrough compositor path.
+        // AVVideoCompositionCoreAnimationTool (animationTool) cannot be combined
+        // with a customVideoCompositorClass, so zoom must be applied here directly.
+        composed = applyZoomTransform(
+            to: composed,
+            renderRect: renderRect,
+            instruction: instruction,
+            compositionTime: compositionTime,
+            placedRect: placedRect
+        )
+
+        // When fixedDuringZoom is true, composite the camera bubble AFTER the zoom so it
+        // stays pinned at its anchor corner regardless of the current zoom effect.
+        if cameraIsFixed,
+           let facecam = makeFacecamLayer(facecam, for: instruction, compositionTime: compositionTime) {
+            composed = facecam.composited(over: composed)
+        }
+
+        return composed.cropped(to: renderRect)
+    }
+
+    private func compositeAnnotations(over image: CIImage, instruction: VideoBackgroundCompositionInstruction,
+                                      compositionTime: Double) -> CIImage {
+        var composed = image
+        let renderSize = instruction.renderSize
+        for annotation in instruction.edits.annotationRegions {
+            guard let span = instruction.editPlan.outputSpans(forSourceSpan: annotation.span).first(where: { $0.contains(compositionTime) }),
+                  let layer = annotationImage(annotation, canvasSize: renderSize) else { continue }
+            let progress = (compositionTime - span.start) / max(0.001, span.duration)
+            let opacity = min(1, min(progress / 0.08, (1 - progress) / 0.08))
+            let positioned = layer.transformed(by: CGAffineTransform(
+                translationX: renderSize.width * annotation.x - layer.extent.width / 2,
+                y: renderSize.height * (1 - annotation.y) - layer.extent.height / 2))
+                .applyingFilter("CIColorMatrix", parameters: ["inputAVector": CIVector(x: 0, y: 0, z: 0, w: opacity)])
+            composed = positioned.composited(over: composed)
+        }
+        return composed
+    }
+
+    // A separate compositor keeps the panel's transparent background and masks from
+    // evicting the full canvas background cache on every frame.
+    private let cameraFaceTracker = CameraFaceTracker()
+    private lazy var cameraPanelCompositor = VideoBackgroundCompositor()
+
+    /// Effects only touch the moving panels; the background stays sharp.
+    func applyCameraTransitionEffects(_ image: CIImage, presentation: CameraLayoutPresentation, canvas: CGSize) -> CIImage {
+        guard presentation.transitionBlur > 0 || presentation.transitionFade > 0 else { return image }
+        var result = image
+        let blur = min(1, max(0, presentation.transitionBlur)) * min(canvas.width, canvas.height) * 0.035
+        if blur > 0.01 {
+            result = result.applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: blur])
+        }
+        let opacity = 1 - min(1, max(0, presentation.transitionFade))
+        if opacity < 1 {
+            result = result.applyingFilter("CIColorMatrix", parameters: ["inputAVector": CIVector(x: 0, y: 0, z: 0, w: opacity)])
+        }
+        return result.cropped(to: CGRect(origin: .zero, size: canvas))
+    }
+
+    private func makeCameraLayoutImage(source: CVPixelBuffer, facecam: CVPixelBuffer?,
+                                      instruction: VideoBackgroundCompositionInstruction,
+                                      compositionTime: Double, presentation: CameraLayoutPresentation) throws -> CIImage {
+        let canvas = instruction.renderSize
+        let bounds = CGRect(origin: .zero, size: canvas)
+        let frames = CameraLayoutGeometry(screen: presentation.screen, camera: presentation.camera)
+        let blur = instruction.styling.backgroundBlurRatio * min(canvas.width, canvas.height)
+        var result = backgroundCache.image(style: instruction.styling.background, extent: bounds, blurRadius: blur) {
+            let background = makeBackground(instruction.styling.background, extent: bounds)
+            return blur > 0 && !instruction.styling.background.isTransparent
+                ? applyGaussianBlur(background, radius: blur).cropped(to: bounds) : background
+        }
+        if !frames.screen.isEmpty && presentation.screenOpacity > 0 {
+            var panelStyling = instruction.styling
+            panelStyling.background = .transparent
+            panelStyling.paddingRatio = 0
+            panelStyling.backgroundBlurRatio = 0
+            panelStyling.shadowIntensity = 0
+            let radius = presentation.screenRadius
+            panelStyling.borderRadiusRatio = radius / min(frames.screen.width, frames.screen.height)
+            let panelCrop = CameraLayoutGeometry.screenCrop(in: instruction.cropRect, panel: frames.screen.size, fit: .cover)
+            var panelEdits = instruction.edits
+            panelEdits.cameraClips = []
+            panelEdits.annotationRegions = []
+            let panel = VideoBackgroundCompositionInstruction(timeRange: instruction.timeRange,
+                trackID: instruction.sourceTrackID, styling: panelStyling,
+                preferredTransform: instruction.preferredTransform, normalizedSize: instruction.normalizedSize,
+                cropRect: panelCrop, renderSize: frames.screen.size, edits: panelEdits,
+                editPlan: instruction.editPlan, cursorTrack: instruction.cursorTrack, cursorSettings: instruction.cursorSettings)
+            let panelImage = try cameraPanelCompositor.makeComposedImage(source: source, facecam: nil,
+                instruction: panel, compositionTime: compositionTime)
+            // Clip after zooming so the panel corners remain fixed alongside the camera.
+            var screen = applyRoundedMask(panelImage, cornerRadius: radius,
+                in: CGRect(origin: .zero, size: frames.screen.size), role: .recording)
+                .transformed(by: CGAffineTransform(translationX: frames.screen.minX, y: canvas.height - frames.screen.maxY))
+            if instruction.scene.isActive {
+                screen = sceneRenderer.render(media: screen, mediaRect: screen.extent, frame: screen.extent,
+                    canvas: canvas, settings: instruction.scene.clamped(to: instruction.editPlan.outputDuration),
+                    time: compositionTime, radius: radius, shadow: instruction.styling.shadowIntensity,
+                    referenceFrame: bounds)
+            }
+            screen = screen.applyingFilter("CIColorMatrix", parameters: [
+                "inputAVector": CIVector(x: 0, y: 0, z: 0, w: presentation.screenOpacity)])
+            screen = applyCameraTransitionEffects(screen, presentation: presentation, canvas: canvas)
+            if !instruction.scene.isActive, instruction.styling.shadowIntensity > 0 {
+                result = makeShadow(screen, intensity: instruction.styling.shadowIntensity, in: screen.extent).composited(over: result)
+            }
+            result = screen.composited(over: result)
+        }
+        result = compositeAnnotations(over: result, instruction: instruction, compositionTime: compositionTime)
+        let sourceTime = instruction.editPlan.sourceTime(forOutputTime: compositionTime) ?? compositionTime
+        // Layout panels share a scene plane. An independent camera stays in its
+        // layout position; screen-content zoom remains separate from scene motion.
+        if var camera = makeFacecamLayer(facecam, for: instruction, compositionTime: compositionTime) {
+            if presentation.overlayZoomShrink > 0 {
+                let effect = TimelineZoomCanvasTransform.activeEffect(edits: instruction.edits,
+                    editPlan: instruction.editPlan, outputTime: compositionTime, cursorTrack: instruction.cursorTrack)
+                let cameraRect = CGRect(x: frames.camera.minX, y: canvas.height - frames.camera.maxY,
+                                        width: frames.camera.width, height: frames.camera.height)
+                camera = camera.transformed(by: CameraLayoutGeometry.overlayZoomTransform(frame: cameraRect,
+                    depth: effect?.depth ?? 1, overlayAmount: 1, shrinkAmount: presentation.overlayZoomShrink))
+            }
+            if instruction.scene.isActive && instruction.scene.resolvedCameraFollowsScene {
+                camera = sceneRenderer.project(camera, canvas: canvas,
+                    pose: instruction.scene.clamped(to: instruction.editPlan.outputDuration).pose(at: compositionTime),
+                    referenceFrame: bounds)
+            }
+            result = camera.composited(over: result)
+        }
+        return result.cropped(to: bounds)
+    }
+
+    private func annotationImage(_ annotation: TimelineAnnotationRegion, canvasSize: CGSize) -> CIImage? {
+        let key = "\(annotation.text)|\(annotation.fontSize)|\(canvasSize.width)"
+        if let cached = annotationCache[key] { return cached }
+        let width = Int(min(canvasSize.width * 0.72, max(180, CGFloat(annotation.text.count * 18))))
+        let height = Int(annotation.fontSize + 24)
+        guard width > 0, height > 0,
+              let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+                space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        context.setFillColor(CGColor(gray: 0, alpha: 0.62))
+        context.addPath(CGPath(roundedRect: CGRect(x: 0, y: 0, width: width, height: height), cornerWidth: 10, cornerHeight: 10, transform: nil))
+        context.fillPath()
+        let line = CTLineCreateWithAttributedString(NSAttributedString(string: annotation.text, attributes: [
+            NSAttributedString.Key(kCTFontAttributeName as String): CTFontCreateWithName("Helvetica" as CFString, annotation.fontSize, nil),
+            NSAttributedString.Key(kCTForegroundColorAttributeName as String): CGColor(gray: 1, alpha: 1)
+        ]))
+        let textWidth = CTLineGetTypographicBounds(line, nil, nil, nil)
+        context.textPosition = CGPoint(x: max(4, (Double(width) - textWidth) / 2), y: 12)
+        CTLineDraw(line, context)
+        guard let image = context.makeImage() else { return nil }
+        let result = CIImage(cgImage: image)
+        annotationCache[key] = result
+        return result
+    }
+
+    private func applyZoomTransform(
+        to image: CIImage,
+        renderRect: CGRect,
+        instruction: VideoBackgroundCompositionInstruction,
+        compositionTime: Double,
+        placedRect: CGRect
+    ) -> CIImage {
+        guard instruction.edits.zoomRegions.isEmpty == false else { return image }
+        let effect = TimelineZoomCanvasTransform.activeEffect(
+            edits: instruction.edits,
+            editPlan: instruction.editPlan,
+            outputTime: compositionTime,
+            cursorTrack: instruction.cursorTrack
+        )
+        guard let effect else { return image }
+        let geometry = AutoZoomGeometry(sourceSize: instruction.normalizedSize, cropRect: instruction.cropRect,
+            contentRect: CGRect(x: placedRect.minX, y: renderRect.height - placedRect.maxY,
+                                width: placedRect.width, height: placedRect.height), canvasSize: renderRect.size)
+        let sourceTime = instruction.editPlan.sourceTime(forOutputTime: compositionTime) ?? compositionTime
+        let settings = instruction.edits.activeCameraSettings(at: sourceTime,
+            duration: instruction.editPlan.segments.last?.sourceEnd ?? instruction.timeRange.duration.seconds,
+            fallback: instruction.facecamFallbackSettings)
+        let mapped = geometry.canvasEffect(effect, cameraSettings: settings)
+        let zoomTransform = TimelineZoomCanvasTransform.transform(for: mapped, in: renderRect, flipsY: true)
+        return image.transformed(by: zoomTransform)
+    }
+
+    private func cameraPresentation(for instruction: VideoBackgroundCompositionInstruction, time: Double) -> CameraLayoutPresentation {
+        instruction.cameraPresentation ?? CameraLayoutMotion.presentation(edits: instruction.edits,
+            plan: instruction.editPlan, time: time,
+            duration: instruction.editPlan.segments.last?.sourceEnd ?? instruction.timeRange.duration.seconds,
+            fallback: instruction.facecamFallbackSettings, canvas: instruction.renderSize,
+            crop: instruction.cropRect, styling: instruction.styling)
+    }
+
+    private func makeFacecamLayer(
+        _ facecam: CVPixelBuffer?,
+        for instruction: VideoBackgroundCompositionInstruction,
+        compositionTime: Double
+    ) -> CIImage? {
+        guard let facecam,
+              instruction.facecamTrackID != nil else {
+            return nil
+        }
+
+        let sourceTime = instruction.editPlan.sourceTime(forOutputTime: compositionTime) ?? compositionTime
+        let presentation = cameraPresentation(for: instruction, time: compositionTime)
+        guard presentation.cameraOpacity > 0 else { return nil }
+        let settings = instruction.edits.activeCameraSettings(
+            at: sourceTime,
+            duration: max(instruction.editPlan.segments.last?.sourceEnd ?? instruction.timeRange.duration.seconds, 0),
+            fallback: instruction.facecamFallbackSettings
+        ) ?? instruction.facecamFallbackSettings ?? defaultFacecamSettings(enabled: true)
+
+        let renderSize = instruction.renderSize
+        let topLeftFrame = presentation.camera
+        guard !topLeftFrame.isEmpty else { return nil }
+
+        let frame = CGRect(
+            x: topLeftFrame.minX,
+            y: renderSize.height - topLeftFrame.maxY,
+            width: topLeftFrame.width,
+            height: topLeftFrame.height
+        )
+        let radius = presentation.cameraRadius
+
+        var image = CIImage(cvPixelBuffer: facecam)
+        image = image.transformed(by: instruction.facecamPreferredTransform)
+        let normalizedRect = image.extent
+        let normalizedSize = instruction.facecamNormalizedSize == .zero
+            ? CGSize(width: max(normalizedRect.width, 1), height: max(normalizedRect.height, 1))
+            : instruction.facecamNormalizedSize
+        image = image
+            .cropped(to: CGRect(origin: normalizedRect.origin, size: normalizedSize))
+            .transformed(by: CGAffineTransform(translationX: -normalizedRect.minX, y: -normalizedRect.minY))
+
+        let detectedFocus = presentation.faceCentering > 0
+            ? cameraFaceTracker.focus(in: image, at: compositionTime) : CGPoint(x: 0.5, y: 0.5)
+        let focus = CGPoint(x: 0.5 + (detectedFocus.x - 0.5) * presentation.faceCentering,
+                            y: 0.5 + (detectedFocus.y - 0.5) * presentation.faceCentering)
+        let placement = CameraFaceFraming.imageFrame(source: normalizedSize, target: frame, focus: focus)
+        let scale = placement.width / max(1, normalizedSize.width)
+        image = image.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+            .transformed(by: CGAffineTransform(translationX: placement.minX, y: placement.minY))
+        let clipped = applyRoundedMask(image.cropped(to: frame), cornerRadius: radius, in: frame, role: .facecam)
+            .applyingFilter("CIColorMatrix", parameters: ["inputAVector": CIVector(x: 0, y: 0, z: 0, w: presentation.cameraOpacity)])
+
+        func finish(_ layer: CIImage) -> CIImage {
+            var decorated = layer
+            if instruction.styling.shadowIntensity > 0 {
+                decorated = layer.composited(over: makeShadow(layer,
+                    intensity: instruction.styling.shadowIntensity, in: layer.extent))
+            }
+            // The camera and its shadow fade and blur together during transitions.
+            return applyCameraTransitionEffects(decorated, presentation: presentation, canvas: renderSize)
+        }
+
+        guard presentation.borderWidth > 0 else {
+            return finish(clipped)
+        }
+
+        let borderColor = SerializableColor(hex: settings.clamped.borderColor)
+        let border = makeRoundedStroke(
+            color: CIColor(
+                red: CGFloat(borderColor.red),
+                green: CGFloat(borderColor.green),
+                blue: CGFloat(borderColor.blue),
+                alpha: CGFloat(borderColor.alpha) * presentation.cameraOpacity
+            ),
+            lineWidth: presentation.borderWidth,
+            in: frame,
+            cornerRadius: radius
+        )
+        return finish(border.composited(over: clipped))
+    }
+
+    private func facecamCornerRadius(for frame: CGRect, settings: FacecamSettings, canvas: CGSize) -> CGFloat {
+        if settings.clamped.isCircle {
+            return min(frame.width, frame.height) / 2
+        }
+
+        return min(CGFloat(settings.clamped.cornerRadius) * CameraLayoutGeometry.decorationScale(in: canvas, settings: settings), min(frame.width, frame.height) / 2)
+    }
+
+    private func sourceLayout(frameRect: CGRect, styling: VideoBackgroundStyling) -> VideoInsetLayout {
+        guard styling.inset.isEnabled else {
+            return VideoInsetLayout(frameRect: frameRect, contentRect: frameRect)
+        }
+        let coreImageBalance = VideoInsetBalance(
+            left: styling.inset.balance.left,
+            top: 1 - styling.inset.balance.top
+        )
+        return VideoInsetGeometry.layout(
+            in: frameRect,
+            amountRatio: styling.inset.amountRatio,
+            balance: coreImageBalance
+        )
+    }
+
+    private func makeCursorLayer(
+        for instruction: VideoBackgroundCompositionInstruction,
+        compositionTime: Double,
+        contentRect: CGRect
+    ) -> CIImage? {
+        let settings = instruction.cursorSettings.clamped
+        guard settings.isVisible,
+              let track = instruction.cursorTrack,
+              track.samples.isEmpty == false else {
+            return nil
+        }
+
+        let sourceTime = instruction.editPlan.sourceTime(forOutputTime: compositionTime) ?? compositionTime
+        guard let point = track.point(at: sourceTime, settings: settings) else {
+            return nil
+        }
+
+        let outputPoint = cursorOutputPoint(
+            telemetryPoint: point,
+            outputTime: compositionTime,
+            contentRect: contentRect,
+            cropRect: instruction.cropRect,
+            sourceSize: instruction.normalizedSize,
+            instruction: instruction,
+            track: track
+        )
+        let cursorSize = CursorOverlayGeometry.glyphSize(
+            contentRect: contentRect,
+            cropRect: instruction.cropRect,
+            settings: settings
+        )
+        guard let glyph = cursorGlyphImage(
+            size: cursorSize,
+            styleID: settings.styleID
+        ) else {
+            return nil
+        }
+
+        return glyph.image.transformed(
+            by: CGAffineTransform(
+                translationX: outputPoint.x - glyph.tipOffset.x,
+                y: outputPoint.y - glyph.tipOffset.y
+            )
+        )
+    }
+
+    private func cursorOutputPoint(
+        telemetryPoint: CGPoint,
+        outputTime: Double,
+        contentRect: CGRect,
+        cropRect: CGRect,
+        sourceSize: CGSize,
+        instruction: VideoBackgroundCompositionInstruction,
+        track: CursorTelemetryTrack
+    ) -> CGPoint {
+        let telemetryWidth = CGFloat(max(track.width, 1))
+        let telemetryHeight = CGFloat(max(track.height, 1))
+        let sourcePoint = CGPoint(
+            x: CGFloat(telemetryPoint.x) / telemetryWidth * sourceSize.width,
+            y: CGFloat(telemetryPoint.y) / telemetryHeight * sourceSize.height
+        )
+        let cropRelativeX = sourcePoint.x - cropRect.minX
+        let cropRelativeY = sourcePoint.y - cropRect.minY
+        let scale = min(contentRect.width / max(cropRect.width, 1), contentRect.height / max(cropRect.height, 1))
+        let scaledSize = CGSize(width: cropRect.width * scale, height: cropRect.height * scale)
+        let placedRect = CGRect(
+            x: contentRect.midX - scaledSize.width / 2,
+            y: contentRect.midY - scaledSize.height / 2,
+            width: scaledSize.width,
+            height: scaledSize.height
+        )
+
+        var point = CGPoint(
+            x: placedRect.minX + cropRelativeX * scale,
+            y: placedRect.maxY - cropRelativeY * scale
+        )
+
+        point.x = min(max(point.x, 0), instruction.renderSize.width)
+        point.y = min(max(point.y, 0), instruction.renderSize.height)
+        return point
+    }
+
+    private func cursorGlyphImage(size: CGFloat, styleID: CursorStyleID) -> CursorGlyphImage? {
+        let resolvedStyleID = CursorStyleRegistry.resolvedStyleID(styleID)
+        let cacheKey = CursorGlyphCacheKey(
+            styleID: resolvedStyleID,
+            sizeKey: Int((size * 10).rounded())
+        )
+        if let cached = cursorGlyphCache[cacheKey] {
+            return cached
+        }
+
+        guard let rendered = CursorStyleRenderer.renderedGlyph(styleID: resolvedStyleID, size: size) else {
+            return nil
+        }
+
+        let glyph = CursorGlyphImage(
+            image: CIImage(cgImage: rendered.image),
+            tipOffset: rendered.bottomLeftHotspot
+        )
+        cursorGlyphCache[cacheKey] = glyph
+        return glyph
+    }
+
+    private func makeInsetLayer(for inset: VideoInsetStyling, in rect: CGRect, cornerRadius: CGFloat) -> CIImage {
+        let color = CIColor(
+            red: CGFloat(inset.color.red),
+            green: CGFloat(inset.color.green),
+            blue: CGFloat(inset.color.blue),
+            alpha: CGFloat(max(0, min(inset.color.alpha * inset.opacity, 1)))
+        )
+        let fill = CIImage(color: color).cropped(to: rect)
+        return applyRoundedMask(fill, cornerRadius: cornerRadius, in: rect)
+    }
+
+    private func makeRoundedFill(color: CIColor, in rect: CGRect, cornerRadius: CGFloat) -> CIImage {
+        let fill = CIImage(color: color).cropped(to: rect)
+        return applyRoundedMask(fill, cornerRadius: cornerRadius, in: rect)
+    }
+
+    private func makeRoundedStroke(color: CIColor, lineWidth: CGFloat, in rect: CGRect, cornerRadius: CGFloat) -> CIImage {
+        let width = max(Int(ceil(rect.width + lineWidth * 2)), 1)
+        let height = max(Int(ceil(rect.height + lineWidth * 2)), 1)
+        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+        guard let context = CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {
+            return CIImage(color: color).cropped(to: .zero)
+        }
+
+        context.setStrokeColor(CGColor(
+            srgbRed: color.red,
+            green: color.green,
+            blue: color.blue,
+            alpha: color.alpha
+        ))
+        context.setLineWidth(lineWidth)
+        let inset = lineWidth / 2
+        let drawRect = CGRect(
+            x: lineWidth,
+            y: lineWidth,
+            width: max(1, rect.width - lineWidth),
+            height: max(1, rect.height - lineWidth)
+        ).insetBy(dx: inset, dy: inset)
+        context.addPath(CGPath(
+            roundedRect: drawRect,
+            cornerWidth: max(0, cornerRadius - inset),
+            cornerHeight: max(0, cornerRadius - inset),
+            transform: nil
+        ))
+        context.strokePath()
+
+        guard let cgImage = context.makeImage() else {
+            return CIImage(color: color).cropped(to: .zero)
+        }
+
+        return CIImage(cgImage: cgImage).transformed(
+            by: CGAffineTransform(
+                translationX: rect.minX - lineWidth,
+                y: rect.minY - lineWidth
+            )
+        )
+    }
+
+    private static func coreImageCropRect(fromTopLeftRect rect: CGRect, sourceSize: CGSize) -> CGRect {
+        let clamped = VideoCropSelection.clampedPixelRect(rect, in: sourceSize)
+        return CGRect(
+            x: clamped.minX,
+            y: max(0, sourceSize.height - clamped.maxY),
+            width: clamped.width,
+            height: clamped.height
+        )
+    }
+
+    private func makeBackground(_ style: BackgroundStyle, extent: CGRect) -> CIImage {
+        switch style {
+        case .transparent:
+            return CIImage(color: CIColor.clear).cropped(to: extent)
+        case let .solid(color):
+            let ciColor = CIColor(red: CGFloat(color.red), green: CGFloat(color.green), blue: CGFloat(color.blue), alpha: CGFloat(color.alpha))
+            return CIImage(color: ciColor).cropped(to: extent)
+        case let .gradient(preset):
+            return renderGradient(preset, extent: extent)
+        case let .wallpaper(preset):
+            return renderWallpaper(preset, extent: extent)
+        }
+    }
+
+    private func renderGradient(_ preset: GradientPreset, extent: CGRect) -> CIImage {
+        let width = max(Int(ceil(extent.width)), 1)
+        let height = max(Int(ceil(extent.height)), 1)
+        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+        guard let context = CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {
+            return CIImage(color: CIColor.black).cropped(to: extent)
+        }
+
+        let stops = preset.sortedStops
+        let cgColors = stops.map { $0.color.cgColor } as CFArray
+        let locations = stops.map { CGFloat($0.position) }
+        guard let gradient = CGGradient(colorsSpace: colorSpace, colors: cgColors, locations: locations) else {
+            return CIImage(color: CIColor.black).cropped(to: extent)
+        }
+
+        let rect = CGRect(origin: .zero, size: CGSize(width: width, height: height))
+        switch preset.kind {
+        case .linear:
+            let endpoints = preset.endpoints(in: rect)
+            context.drawLinearGradient(
+                gradient,
+                start: endpoints.start,
+                end: endpoints.end,
+                options: [.drawsBeforeStartLocation, .drawsAfterEndLocation]
+            )
+        case .radial:
+            let endpoints = preset.endpoints(in: rect)
+            let endRadius = preset.radialRadius(in: rect)
+            context.drawRadialGradient(
+                gradient,
+                startCenter: endpoints.start,
+                startRadius: 0,
+                endCenter: endpoints.end,
+                endRadius: endRadius,
+                options: [.drawsBeforeStartLocation, .drawsAfterEndLocation]
+            )
+        }
+
+        guard let cgImage = context.makeImage() else {
+            return CIImage(color: CIColor.black).cropped(to: extent)
+        }
+        return CIImage(cgImage: cgImage).transformed(by: CGAffineTransform(translationX: extent.minX, y: extent.minY))
+    }
+
+    private func renderWallpaper(_ preset: WallpaperPreset, extent: CGRect) -> CIImage {
+        guard let url = preset.fullURL, let cgImage = WallpaperImageCache.cgImage(for: url) else {
+            return CIImage(color: CIColor.gray).cropped(to: extent)
+        }
+        var image = CIImage(cgImage: cgImage)
+        let scale = max(extent.width / max(image.extent.width, 1), extent.height / max(image.extent.height, 1))
+        image = image.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        let dx = extent.midX - image.extent.midX
+        let dy = extent.midY - image.extent.midY
+        image = image.transformed(by: CGAffineTransform(translationX: dx, y: dy))
+        return image.cropped(to: extent)
+    }
+
+    private func applyGaussianBlur(_ image: CIImage, radius: Double) -> CIImage {
+        guard radius > 0, let filter = CIFilter(name: "CIGaussianBlur") else { return image }
+        filter.setValue(image.clampedToExtent(), forKey: kCIInputImageKey)
+        filter.setValue(radius, forKey: kCIInputRadiusKey)
+        return filter.outputImage ?? image
+    }
+
+    private func applyRoundedMask(_ image: CIImage, cornerRadius: CGFloat, in rect: CGRect,
+                                  role: VideoRoundedMaskCache.Role? = nil) -> CIImage {
+        let localMask: CIImage?
+        if let role, cacheMasks {
+            localMask = roundedMaskCache.mask(size: rect.size, cornerRadius: cornerRadius, role: role)
+        } else {
+            // Inset/decorative geometry must not evict the recording or facecam raster.
+            localMask = VideoRoundedMaskCache.makeMask(size: rect.size, cornerRadius: cornerRadius)
+        }
+        guard let localMask else { return image }
+        let maskImage = localMask.transformed(by: CGAffineTransform(translationX: rect.minX, y: rect.minY))
+
+        guard let filter = CIFilter(name: "CIBlendWithMask") else { return image }
+        filter.setValue(image, forKey: kCIInputImageKey)
+        filter.setValue(CIImage(color: CIColor.clear).cropped(to: image.extent), forKey: kCIInputBackgroundImageKey)
+        filter.setValue(maskImage, forKey: kCIInputMaskImageKey)
+        return filter.outputImage ?? image
+    }
+
+    private func makeShadow(_ image: CIImage, intensity: Double, in rect: CGRect) -> CIImage {
+        let blurRadius = 38 * intensity
+        // Use only the panel's alpha silhouette. Blurring its colors produces a
+        // tinted glow, and clamping the edges can spread opaque pixels indefinitely.
+        let silhouette = image.cropped(to: rect).applyingFilter("CIColorMatrix", parameters: [
+            "inputRVector": CIVector(x: 0, y: 0, z: 0, w: 0),
+            "inputGVector": CIVector(x: 0, y: 0, z: 0, w: 0),
+            "inputBVector": CIVector(x: 0, y: 0, z: 0, w: 0)
+        ])
+        let blurred = silhouette.applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: blurRadius])
+        let offset = blurred.transformed(by: CGAffineTransform(translationX: 0, y: -18 * intensity))
+        return setOpacity(offset, alpha: 0.55 * intensity)
+    }
+
+    private func setOpacity(_ image: CIImage, alpha: Double) -> CIImage {
+        guard let filter = CIFilter(name: "CIColorMatrix") else { return image }
+        filter.setValue(image, forKey: kCIInputImageKey)
+        filter.setValue(CIVector(x: 1, y: 0, z: 0, w: 0), forKey: "inputRVector")
+        filter.setValue(CIVector(x: 0, y: 1, z: 0, w: 0), forKey: "inputGVector")
+        filter.setValue(CIVector(x: 0, y: 0, z: 1, w: 0), forKey: "inputBVector")
+        filter.setValue(CIVector(x: 0, y: 0, z: 0, w: CGFloat(alpha)), forKey: "inputAVector")
+        return filter.outputImage ?? image
+    }
+}

@@ -1,0 +1,67 @@
+import Foundation
+import XCTest
+
+final class PrivacyUsageDescriptionTests: XCTestCase {
+    private typealias PlistDictionary = [String: Any]
+    private typealias TypeTagSpecification = [String: [String]]
+    private static let projectTypeIdentifier = "dev.openrecorder.project"
+    private static let projectFilenameExtension = "openrecorder"
+
+    func testInfoPlistDeclaresCameraAndMicrophoneUsageDescriptions() throws {
+        let plist = try loadInfoPlist()
+
+        XCTAssertEqual(plist["CFBundleName"] as? String, "Record Mac")
+        XCTAssertEqual(plist["LSMinimumSystemVersion"] as? String, "15.0")
+        XCTAssertEqual(
+            plist["NSCameraUsageDescription"] as? String,
+            "Record Mac uses the camera when you choose to include a camera recording in a screen recording."
+        )
+        XCTAssertEqual(
+            plist["NSMicrophoneUsageDescription"] as? String,
+            "Record Mac uses the microphone when you choose to include narration in a screen recording."
+        )
+    }
+
+    func testInfoPlistDocumentTypeMatchesExportedProjectType() throws {
+        let plist = try loadInfoPlist()
+        let documentType = try XCTUnwrap(
+            (plist["CFBundleDocumentTypes"] as? [PlistDictionary])?.first,
+            "Info.plist should declare a document type"
+        )
+        let exportedType = try XCTUnwrap(
+            (plist["UTExportedTypeDeclarations"] as? [PlistDictionary])?.first,
+            "Info.plist should export the Open Recorder project type"
+        )
+
+        XCTAssertEqual(documentType["CFBundleTypeExtensions"] as? [String], [Self.projectFilenameExtension])
+        XCTAssertEqual(documentType["CFBundleTypeName"] as? String, "Open Recorder Project")
+        XCTAssertEqual(documentType["CFBundleTypeRole"] as? String, "Editor")
+        XCTAssertEqual(documentType["LSHandlerRank"] as? String, "Owner")
+        XCTAssertEqual(documentType["LSItemContentTypes"] as? [String], [Self.projectTypeIdentifier])
+        XCTAssertEqual(exportedType["UTTypeIdentifier"] as? String, Self.projectTypeIdentifier)
+        XCTAssertEqual(exportedType["UTTypeDescription"] as? String, "Open Recorder Project")
+        XCTAssertEqual(exportedType["UTTypeConformsTo"] as? [String], ["public.json"])
+        let actualTypeTagSpecification = exportedType["UTTypeTagSpecification"] as? TypeTagSpecification
+        let expectedTypeTagSpecification: TypeTagSpecification = [
+            "public.filename-extension": [Self.projectFilenameExtension]
+        ]
+        XCTAssertEqual(actualTypeTagSpecification, expectedTypeTagSpecification)
+    }
+
+    private func loadInfoPlist() throws -> PlistDictionary {
+        let url = packageRoot()
+            .appendingPathComponent("Resources/Info.plist")
+        let data = try Data(contentsOf: url)
+        var format = PropertyListSerialization.PropertyListFormat.xml
+        let plist = try PropertyListSerialization.propertyList(from: data, format: &format)
+
+        return try XCTUnwrap(plist as? PlistDictionary, "Resources/Info.plist should be a dictionary")
+    }
+
+    private func packageRoot() -> URL {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+    }
+}

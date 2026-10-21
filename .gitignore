@@ -1,0 +1,19 @@
+# Swift / SwiftPM
+.build/
+DerivedData/
+*.swiftpm/
+Packages/
+.swiftpm/
+
+# Xcode
+xcuserdata/
+*.xcuserstate
+*.xcscmblueprint
+
+# macOS
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
+*.swp
