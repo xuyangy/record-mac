@@ -7,7 +7,7 @@ enum AppVariant {
     static func isNightly(bundleIdentifier: String?) -> Bool {
         bundleIdentifier == nightlyBundleIdentifier
     }
-    static var storageDirectoryName: String { isNightly ? "OpenRecorderNightly" : "Open Recorder" }
+    static var storageDirectoryName: String { isNightly ? "RecordMacNightly" : "Record Mac" }
     static func serviceEnvironment(
         inherited: [String: String] = ProcessInfo.processInfo.environment,
         bundleIdentifier: String? = Bundle.main.bundleIdentifier

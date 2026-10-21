@@ -28,12 +28,31 @@ AGPL-3.0 (constitution, Principle V).
 | Package | Repository | Pin | License | AGPL-3.0-compatible | Backs |
 |---|---|---|---|---|---|
 | KeyboardShortcuts | https://github.com/sindresorhus/KeyboardShortcuts | version 2.2.4, revision `7ecc38bb6edf7d087d30e737057b8d8a9b7f51eb` | MIT (`licenses/KeyboardShortcuts/LICENSE`) | yes: permissive | FR-064, FR-065 |
-| SwiftLAME | https://github.com/hidden-spectrum/SwiftLAME | revision `e8256a8151594f47f103c742f684253c6c44871d` | LGPL-2.1 (`licenses/SwiftLAME/LICENSE`) | yes: LGPL-2.1 permits conversion to GPL, and GPL-3.0 code may be combined with AGPL-3.0 | FR-021 (MP3) |
-| LAME (bundled inside SwiftLAME as its `LAME` target) | https://lame.sourceforge.io | as bundled at the SwiftLAME revision above | LGPL-2.0 (`licenses/LAME/COPYING`, `licenses/LAME/LICENSE`) | yes: same reasoning as SwiftLAME | FR-021 (MP3) |
+| SwiftLAME | https://github.com/hidden-spectrum/SwiftLAME | revision `e8256a8151594f47f103c742f684253c6c44871d` | LGPL-2.1 (`licenses/SwiftLAME/LICENSE`) | yes, used under the LGPL (see below) | FR-021 (MP3) |
+| LAME (bundled inside SwiftLAME as its `LAME` target) | https://lame.sourceforge.io | as bundled at the SwiftLAME revision above | LGPL: most source files carry "version 2 … or (at your option) any later version" notices, and `libmp3lame/gain_analysis.c` and `gain_analysis.h` carry "version 2.1 … or later" (`licenses/LAME/COPYING`, `licenses/LAME/LICENSE`) | yes, used under the LGPL (see below) | FR-021 (MP3) |
 
 Both pins are the ones QuickRecorder resolves at the revision above. SwiftLAME is pinned by
 revision rather than version because its manifest uses `unsafeFlags`, which SwiftPM accepts only
 from dependencies pinned by revision or branch.
+
+**How SwiftLAME and LAME are used.** They stay under their own LGPL terms; this project does not
+exercise the LGPL's option to convert them to the GPL. SwiftPM links both statically into the
+`RecordMac` executable: the built binary defines `_lame_init` and the other `_lame_*` entry
+points itself and loads no separate LAME or SwiftLAME library (checked with `nm` and `otool -L`
+on the packaged app). For as long as the application is only built and run locally, this
+creates no obligation. If a binary is ever given to anyone, the LGPL's terms for a statically
+linked library apply to that distribution, and the recipient must be given, with it:
+
+- the complete corresponding source of SwiftLAME and LAME at the pinned revision, with any
+  changes made to them;
+- the application's own source or object files, with build instructions that let the
+  recipient relink the application against a modified SwiftLAME or LAME;
+- the LGPL license texts above.
+
+Pinning a revision or publishing an AGPL source tree does not by itself deliver those; the
+distribution must include them or a written offer for them, and the linkage must be checked on
+the binary actually distributed. The AGPL-3.0 source offer for the application is compatible
+with, and can carry, the relinking materials.
 
 Not carried: Sparkle (auto-update; Principle IV), AECAudioStream and MatrixColorSelector
 (research.md R-005, R-012).
@@ -60,7 +79,11 @@ these files.
 | `apps/macos/Sources/OpenRecorderMac/Resources/Wallpapers/` | `apps/macos/Sources/RecordMac/Resources/Wallpapers/` | Only the 12 photographs and 4 videos credited in `CREDITS.md` are carried; the 23 images with no stated credit or license, and their thumbnails, are not. `Render/BackgroundPresets.swift` drops their 23 presets, so the default background is the first credited photograph. The 4 video loops' previews are new thumbnails made from each video's first frame (`thumbs/loop-*.jpg`, recorded in `CREDITS.md`). |
 | `apps/macos/Resources/Info.plist`, `OpenRecorder.entitlements`, `AppIcon.icns` | `apps/macos/Resources/` | Vendored. `Info.plist`: Sparkle keys (`SUFeedURL`, `SUPublicEDKey`, `SUEnableAutomaticChecks`, `SUScheduledCheckInterval`, `SUAllowsAutomaticUpdates`) removed; bundle name `Record Mac`, identifier `local.recordmac.app`, executable `RecordMac`, version `0.1.0`, and usage descriptions renamed to this project. The project document type keeps upstream's `openrecorder` extension, which the vendored code still uses, until the project format task replaces it. The entitlements file is renamed `RecordMac.entitlements`. |
 | `apps/macos/Package.swift` | `apps/macos/Package.swift` | Adapted (T004): package and targets renamed, Sparkle removed, Swift 5 language mode, KeyboardShortcuts and SwiftLAME added. |
-| root `Makefile` | `Makefile` | Adapted (T007): Rust service, `pnpm`, landing site, and packaging-script targets removed. |
+| root `Makefile` | `Makefile` | Adapted (T007): Rust service, `pnpm`, landing site, and upstream packaging-script targets removed; `package-macos` and `run-macos` use `scripts/package-macos-app.zsh`, and builds export `DEVELOPER_DIR` to Xcode. |
+| `scripts/package-macos-app-shared.zsh` | `scripts/package-macos-app.zsh` | Adapted: assembles `RecordMac.app` from the executable, `Info.plist`, `AppIcon.icns`, and every SwiftPM resource bundle, signs it with `RecordMac.entitlements` using `CODE_SIGN_IDENTITY` or an ad-hoc signature, checks the packaged identifier and purpose strings, and optionally launches it. Upstream's Rust service, caption helper, Sparkle framework, variants, notarisation, and installation steps are not carried. |
+| `apps/macos/Sources/OpenRecorderMac/AppVariant.swift` | `apps/macos/Sources/RecordMac/App/AppVariant.swift` | The Application Support folder is `Record Mac` (`RecordMacNightly` for the nightly identifier), so this app never writes into an Open Recorder installation's storage. |
+| `apps/macos/Tests/OpenRecorderMacTests/ReleaseVersionTests.swift` | — | Removed: its only reference was the Rust service's `Cargo.toml`, which is not carried. `PrivacyUsageDescriptionTests.swift` checks the bundle identifier, executable, and version format instead. |
+| `apps/macos/Tests/OpenRecorderMacTests/EditorInteractionSemanticsTests.swift` | `apps/macos/Tests/RecordMacTests/EditorInteractionSemanticsTests.swift` | The playback-speed label expectation uses the current locale's decimal separator, since the label is locale-formatted. |
 
 Not taken: `apps/rust-service` (research.md R-003), `apps/landing`, `scripts/`, `docs/`,
 `apps/macos/Resources/Branding/`, `apps/macos/Package.resolved`.
@@ -78,7 +101,13 @@ Removed after vendoring:
   `captions` field and `replaceCaptions` event of the timeline edit snapshot, caption
   compositing in `VideoBackgroundCompositor.swift`, the caption preview overlay, and the export
   dialog's "Include captions" option. The inspector's audio inputs are renamed `audioEdits` and
-  `audioPlayback`.
+  `audioPlayback`. A project saved by open-recorder with captions opens here without them, and
+  saving it drops its caption field.
+
+Still carrying upstream names, until the project format task (T021) replaces them: the
+`.openrecorder` project extension and its document type, the `dev.openrecorder.*` logger
+subsystems and queue labels, and the `dev.openrecorder.app.nightly` identifier `AppVariant` uses
+to detect a nightly build.
 
 ### From QuickRecorder (`e820517`)
 

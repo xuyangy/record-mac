@@ -277,7 +277,9 @@ final class PreviewPlaybackSpeedSelectionTests: XCTestCase {
     func testRejectsUnsupportedSelectionAndFormatsLabels() {
         XCTAssertEqual(PreviewPlaybackSpeedSelection.cycleCount(from: 1, to: 3, availableSpeeds: [1, 2, 4]), 0)
         XCTAssertEqual(PreviewPlaybackSpeedSelection.label(for: 2), "2x")
-        XCTAssertEqual(PreviewPlaybackSpeedSelection.label(for: 1.25), "1.25x")
+        // The label follows the user's locale, so the decimal separator is the locale's own.
+        let decimalSeparator = Locale.current.decimalSeparator ?? "."
+        XCTAssertEqual(PreviewPlaybackSpeedSelection.label(for: 1.25), "1\(decimalSeparator)25x")
         XCTAssertEqual(PreviewPlaybackSpeedSelection.label(for: .infinity), "1x")
         XCTAssertEqual(PreviewPlaybackSpeedSelection.label(for: .nan), "1x")
     }

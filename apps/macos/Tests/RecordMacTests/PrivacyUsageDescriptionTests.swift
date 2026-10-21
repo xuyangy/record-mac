@@ -22,6 +22,17 @@ final class PrivacyUsageDescriptionTests: XCTestCase {
         )
     }
 
+    func testInfoPlistDeclaresBundleIdentityAndVersion() throws {
+        let plist = try loadInfoPlist()
+
+        XCTAssertEqual(plist["CFBundleIdentifier"] as? String, "local.recordmac.app")
+        XCTAssertEqual(plist["CFBundleExecutable"] as? String, "RecordMac")
+        let shortVersion = try XCTUnwrap(plist["CFBundleShortVersionString"] as? String)
+        XCTAssertNotNil(shortVersion.range(of: #"^\d+\.\d+\.\d+$"#, options: .regularExpression),
+                        "CFBundleShortVersionString should be MAJOR.MINOR.PATCH")
+        XCTAssertEqual(plist["CFBundleVersion"] as? String, shortVersion)
+    }
+
     func testInfoPlistDocumentTypeMatchesExportedProjectType() throws {
         let plist = try loadInfoPlist()
         let documentType = try XCTUnwrap(
