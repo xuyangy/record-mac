@@ -145,7 +145,7 @@ platform decoder.
 3. A user-bound hotkey suspends activity recording outright (FR-024).
 
 **Rationale**: FR-041 and SC-009 admit no exceptions, so a single signal is not enough. Failing
-closed — recording nothing when the state cannot be determined — costs at most a missing badge,
+closed — recording no key events when the state cannot be determined — costs at most a missing badge,
 while failing open leaks a password into a video.
 
 **Verification**: this is pure logic once the signal is captured, so suppression is unit-testable

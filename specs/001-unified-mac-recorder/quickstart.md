@@ -47,13 +47,13 @@ outbound connections across the whole cycle (SC-010).
 ## Gate 2 — Capture fidelity (Principle I, FR-017, FR-050)
 
 ```bash
-swift test --filter ProjectFormatTests   # round-trip, migration, atomicity, immutability
+swift test --filter 'ProjectFormatTests|ProjectMigrationTests|AutosaveAtomicityTests|CaptureImmutabilityTests'
 ```
 
 Then by hand:
 
 1. Record 10 minutes with camera, microphone, and system audio on.
-2. Confirm `media/` holds `screen.mov`, `camera.mov`, `microphone.m4a`, and `system.m4a` as
+2. Confirm `media/` holds `screen.mov`, `camera-1.mov`, `microphone.m4a`, and `system.m4a` as
    separate files.
 3. Note the hash of each media file: `shasum media/*`.
 4. Edit heavily — split, change speed, move zooms, restyle the background — then export.
@@ -72,8 +72,8 @@ its own dropped-frame count.
 Export with the transparency-channel preset, then verify **with the platform decoder**:
 
 ```bash
-# Correct check — AVFoundation reads the auxiliary alpha layer
-swift run alphaverify exported.mov
+# Correct check — the test decodes with AVFoundation, which reads the auxiliary alpha layer
+swift test --filter AlphaExportTests
 ```
 
 Do **not** verify with `ffprobe` or `ffmpeg`. They ignore Apple's muxed alpha layer and report a
@@ -92,16 +92,17 @@ confirm the suspend hotkey stops recording activity immediately.
 
 ## Gate 6 — Generators still pass their own tests (R-004)
 
-Screenize's generator tests are carried across and must keep passing unmodified:
+Screenize's generator tests are carried across and must keep passing with their assertions
+unmodified:
 
 ```bash
-swift test --filter GeneratorTests
+SUITES='SpringDamperSimulator|WaypointGenerator|AdaptiveResponse|MicroTracker|DeadZoneTarget|StartupCameraPolicy|SegmentPlanner|SegmentSpringSimulator|ShotPlanner|IntentClassifier|EventTimeline|EventStreamAdapter'
+swift test list | grep -cE "$SUITES"   # must be greater than zero, or the filter ran nothing
+swift test --filter "$SUITES"
 ```
 
-Covers `SpringDamperSimulator`, `WaypointGenerator`, `AdaptiveResponse`, `MicroTracker`,
-`DeadZoneTarget`, `StartupCameraPolicy`, `SegmentPlanner`, `ShotPlanner`, `IntentClassifier`. A
-failure here means the telemetry adapter is feeding them something they did not expect — fix the
-adapter, not the test.
+A failure is first investigated at the telemetry adapter, which is the usual cause. Import and
+module wiring in a vendored test may change; its assertions may not.
 
 ## Gate 7 — Manual zoom edits survive regeneration (FR-033)
 
@@ -112,9 +113,18 @@ adapter, not the test.
 
 ## Gate 8 — Hardware degradation is visible (FR-071)
 
-On the Intel reference machine, confirm the app launches, states that live presenter overlay is
-unavailable, and still composites the camera into the exported file with the same result.
+On the Intel reference machine, exercise each fallback path and confirm the app launches, names
+the reduced capability, and still produces the output:
 
+| Capability | Reduced when | Expected result |
+|---|---|---|
+| Presenter overlay | always on Intel | camera composited into the export with the same result |
+| Alpha encode | encoder unavailable | export states no transparency, never silent opaque output |
+| Hardware H.264/HEVC | encoder unavailable | software encode used and named |
+| Frame-rate headroom | settings exceed it | FR-072 warning shown; recording may proceed |
+| Each permission | not granted | capability named, route to System Settings offered |
+
+Where an Apple Silicon Mac is available, confirm the same paths take the full-capability branch.
 Nothing may fail silently, and the app must never refuse to launch.
 
 ## End-to-end acceptance
@@ -123,3 +133,28 @@ One pass of User Story 1 through 5 from the spec: record a 10-minute tutorial wi
 both audio sources, let automatic zoom and badges apply untouched, adjust one zoom and one camera
 placement, export MP4 at 1080p, and export a GIF of one span. Expected total: publishable video
 without opening any other application (SC-001).
+
+## Acceptance matrix
+
+Every success criterion and gate, with where it is checked. All runs are on the reference
+machine unless stated. Record each result — host, OS, settings, observation — in the change that
+closes it.
+
+| Item | Phase | Fixture | Method | Pass rule |
+|---|---|---|---|---|
+| SC-001 | 9 | 10-min tutorial | end-to-end pass above | export meets US2 scenario 2; no other app opened |
+| SC-002 / Gate 3 | 3, 9 | 10-min native capture, preview on | app's dropped-frame count | ≤ 1%, none from preview |
+| SC-003 | 9 | cold start, permissions granted | count interactions to recording | ≤ 3 |
+| SC-004 | 9 | 10-min recording | time from stop to editor ready | ≤ 5 s |
+| SC-005 | 9 | fixed click-driven corpus recording | owner reviews generated zooms | unchanged / total ≥ 80% |
+| SC-006 | 9 | 10-min corpus recording | time 1080p H.264 export, high quality, default effects | ≤ 20 min |
+| SC-007 | 5 | corpus recording | toggle every derived effect off and on | each changes without re-recording |
+| SC-008 | 7 | two-audio recording | inspect delivered file tracks | mic and system audio separate in every multi-track path |
+| SC-009 / Gate 5 | 2, 9 | synthetic stream + hand test | tests + login, `sudo`, Keychain | no secure key in any output |
+| SC-010 / Gate 1 | 1, 9 | full cycle | `nm`, `otool`, `nettop` | zero outbound connections |
+| SC-011 / Gate 8 | 9 | — | fallback table above | every reduction named |
+| SC-012 | 2 | fixture per format version | migration tests | every version opens |
+| Gate 2 | 2, 3 | 10-min recording | tests + hashes | hashes unchanged |
+| Gate 4 | 7 | alpha export | `AlphaExportTests` | alpha preserved by platform decoder |
+| Gate 6 | 2 | vendored suites | command above | nonzero count, all pass |
+| Gate 7 | 4 | click-heavy recording | regenerate after manual edit | manual move unchanged |

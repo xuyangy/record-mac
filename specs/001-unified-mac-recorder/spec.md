@@ -189,7 +189,9 @@ from inside the application.
 - **Display configuration changes** mid-recording: resolution change, display added or removed,
   or scale factor change.
 - **Disk fills** during a long recording or an export.
-- **Machine sleeps, locks, or the user switches accounts** during a recording.
+- **Machine sleeps, locks, or the user switches accounts** during a recording: the recording
+  stops cleanly, everything captured up to that moment is kept as a valid project, and the
+  creator is told why it stopped.
 - **Zero-activity recording**: no clicks, no typing, no pointer movement — automatic zoom must
   produce a sensible static result rather than drifting.
 - **Extremely dense activity**: rapid clicking or continuous typing must not produce zoom
@@ -247,8 +249,9 @@ from inside the application.
 
 ### Functional Requirements — Activity Recording
 
-- **FR-022**: System MUST record pointer positions, clicks, scrolling, dragging, and key
-  presses during capture, timestamped against the same clock as the video.
+- **FR-022**: System MUST record pointer positions, clicks, scrolling, dragging, key presses,
+  and changes of the active window during capture, timestamped against the same clock as the
+  video.
 - **FR-023**: System MUST record which on-screen element or region was the target of pointer
   and keyboard activity, where the operating system exposes it.
 - **FR-024**: System MUST NOT record the contents of secure text entry fields, and MUST provide
@@ -288,9 +291,11 @@ from inside the application.
 - **FR-038**: System MUST display a ripple or equivalent emphasis at each click.
 - **FR-039**: Users MUST be able to turn badges and ripples on or off, and adjust their
   position, size, and duration, after recording.
-- **FR-040**: When input arrives faster than badges can be read, System MUST combine or queue
-  them so that no two badges overlap and each stays visible long enough to be read.
-- **FR-041**: System MUST never display a badge derived from secure text entry.
+- **FR-040**: Each badge MUST stay visible for at least 0.8 seconds. When input arrives faster
+  than that, System MUST combine the incoming keys into the badge already showing rather than
+  stacking new badges, so that no two badges overlap.
+- **FR-041**: System MUST never display a badge derived from secure text entry (the output side
+  of FR-024).
 
 ### Functional Requirements — Timeline Editing
 
@@ -312,13 +317,16 @@ from inside the application.
 
 - **FR-051**: System MUST export MP4 and MOV video.
 - **FR-052**: System MUST export animated GIF with selectable size, frame rate, and looping.
-- **FR-053**: System MUST offer resolution presets from 480p through 4K, capped at what the
-  capture and hardware can produce, and MUST offer quality presets.
+- **FR-053**: System MUST offer resolution presets from 480p through 4K, plus a source preset
+  that exports at the capture's own pixel dimensions (for example 2880x1800) when they do not
+  exceed 4K, all capped at what the capture and hardware can produce, and MUST offer quality
+  presets.
 - **FR-054**: System MUST offer a choice of color handling appropriate to standard and
   wide-gamut delivery.
 - **FR-055**: System MUST support exporting video with a transparency channel. On hardware
   that cannot produce one, this degrades under FR-071 rather than failing silently.
-- **FR-056**: System MUST export screenshots as still images to a file or the clipboard.
+- **FR-056**: System MUST export screenshots as still images to a file or the clipboard (the
+  delivery side of FR-008).
 - **FR-057**: System MUST show export progress and allow cancellation.
 - **FR-058**: Users MUST be able to save and reuse export presets.
 
@@ -341,7 +349,8 @@ from inside the application.
   resuming, and stopping a recording, usable while another application is focused.
 - **FR-065**: Users MUST be able to change those shortcuts.
 - **FR-066**: System MUST provide pointer highlighting and an on-screen magnifier usable live
-  during a recording.
+  during a recording. Both are excluded from the captured screen video, as cursor styling is a
+  render-time effect.
 - **FR-067**: System MUST request each operating-system permission only when a capability
   needing it is used, stating why, and MUST offer a direct route to the relevant system
   settings when one is missing.
@@ -360,8 +369,9 @@ from inside the application.
 - **FR-071**: Where a capability depends on hardware the machine lacks, System MUST detect this
   at startup or on use, substitute its own equivalent where one exists, and show the creator
   what is reduced. It MUST NOT refuse to launch or fail silently.
-- **FR-072**: System MUST warn before starting a recording whose settings the current hardware
-  is unlikely to sustain, and MUST let the creator proceed anyway.
+- **FR-072**: System MUST warn before starting a recording whose settings exceed the frame-rate
+  headroom measured by capability detection, and MUST let the creator proceed anyway. Settings
+  the hardware cannot produce at all are refused with a reason instead.
 
 ### Key Entities
 
@@ -369,8 +379,9 @@ from inside the application.
   and a format version. The unit the library lists and the editor opens.
 - **Media Track**: one captured stream — screen, camera, microphone, or system audio — stored
   as captured and never rewritten by editing.
-- **Activity Event**: one timestamped input occurrence — pointer move, click, scroll, drag, or
-  key press — with its target where known. The source for zoom, badges, and ripples.
+- **Activity Event**: one timestamped input occurrence — pointer move, click, scroll, drag, key
+  press, or active-window change — with its target where known. The source for zoom, badges,
+  and ripples.
 - **Zoom Move**: a span of time with a focus point and depth, either generated from activity or
   placed by the creator, carrying a flag marking it as manually adjusted.
 - **Presentation Settings**: background, corners, shadow, padding, inset, crop, aspect, cursor
@@ -384,8 +395,8 @@ from inside the application.
 
 ### Measurable Outcomes
 
-- **SC-001**: A creator records a ten-minute tutorial and publishes a polished video without
-  opening any other application.
+- **SC-001**: A creator records a ten-minute tutorial and publishes a video that meets User
+  Story 2 acceptance scenario 2 without opening any other application.
 - **SC-002**: A ten-minute recording at the reference machine's native display resolution loses
   no more than 1% of frames, and the live preview causes none of that loss.
 - **SC-003**: Starting a recording takes no more than three interactions from a cold start.
@@ -395,7 +406,7 @@ from inside the application.
 - **SC-006**: Exporting a ten-minute recording at 1080p completes in no more than twice its
   running time on the reference machine.
 - **SC-007**: Every effect derived from recorded activity can be changed or removed after
-  recording, in every case, without re-recording.
+  recording, in every case, without re-recording (the measurable form of FR-025).
 - **SC-008**: Microphone and system audio remain independently adjustable through to a
   delivered file in every export path that supports multiple tracks.
 - **SC-009**: No keystroke entered into a secure field appears in any output, across the full

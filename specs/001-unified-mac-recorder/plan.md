@@ -19,8 +19,8 @@ macOS 14 and satisfies the constitution's platform floor.
 
 ## Technical Context
 
-**Language/Version**: Swift 6.0.3 (toolchain present), swift-tools-version 6.2 inherited from
-the base package manifest
+**Language/Version**: Swift 6.0 (toolchain present: 6.0.3); the manifest declares
+swift-tools-version 6.0
 
 **Primary Dependencies**: ScreenCaptureKit (capture, system audio), AVFoundation (camera,
 encode, mux), VideoToolbox (hardware HEVC incl. alpha), Core Media (clocks), CoreGraphics event
@@ -127,7 +127,8 @@ apps/macos/
 ├── Sources/RecordMac/
 │   ├── App/                           # open-recorder: AppModel, entry point, menu bar
 │   ├── Capture/                       # QuickRecorder: RecordEngine, SCContext, area/window
-│   │                                  # /app selectors, audio loopback, alpha encode
+│   │   │                              # /app selectors, audio loopback, alpha encode
+│   │   └── Sources/                   # one file per capture source kind
 │   ├── Telemetry/                     # new: event tap, secure-field suppression,
 │   │                                  # accessibility targeting, clock alignment
 │   │                                  # Screenize: EventStreamAdapter, UnifiedEvent
@@ -139,10 +140,16 @@ apps/macos/
 │   ├── Render/                        # open-recorder presentation + Screenize overlay emitters
 │   ├── Export/                        # open-recorder: VideoExportOptions, GIF, presets
 │   └── Project/                       # project format, versioning, migration, library
-└── Tests/RecordMacTests/
-    ├── Generators/                    # Screenize's generator tests, carried across intact
-    ├── Project/                       # format round-trip and migration
-    └── Telemetry/                     # secure-field suppression, clock alignment
+└── Tests/
+    ├── RecordMacTests/
+    │   ├── Capture/                   # audio separation, frame-drop policy, pause lifecycle
+    │   ├── Editor/                    # timeline edits, undo, retiming
+    │   ├── Export/                    # presets, alpha round-trip, delivered tracks
+    │   ├── Generators/                # Screenize's generator tests, carried across intact
+    │   ├── Project/                   # format round-trip and migration
+    │   ├── Render/                    # badges, ripples, regression corpus
+    │   └── Telemetry/                 # parsing, secure-field suppression, clock alignment
+    └── Fixtures/                      # regression corpus: stored captures with telemetry
 ```
 
 **Structure Decision**: Single SwiftPM executable target at `apps/macos`, inheriting

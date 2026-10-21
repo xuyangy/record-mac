@@ -23,13 +23,22 @@ recorder (R-004).
 ## Guarantees
 
 1. **Same clock as media.** Every event timestamp maps to a capture frame without drift (FR-022).
-2. **Secure input never recorded.** No key event is emitted while secure event input is active,
-   while the focused element is a secure text field, or while suspended. When the state cannot be
-   determined, record nothing (R-007, FR-041, SC-009).
-3. **Append-only, then frozen.** After `end()` the stream is immutable, so every derived effect
+2. **Secure input never recorded.** No key event is emitted while secure event input is active
+   or while the focused element is a secure text field. When either state cannot be determined,
+   no key event is emitted (R-007, FR-041, SC-009). Pointer events are unaffected.
+3. **Suspend stops everything.** While suspended, no event of any kind is emitted (FR-024).
+4. **No content.** `target` and `window` carry roles, identifiers, and frames only — never
+   field values, typed text, or window titles.
+5. **Append-only, then frozen.** After `end()` the stream is immutable, so every derived effect
    can be recomputed from it forever (FR-025, SC-007).
-4. **Targeting is optional.** `target` is populated where Accessibility exposes it and absent
+6. **Targeting is optional.** `target` is populated where Accessibility exposes it and absent
    otherwise. Generators must tolerate its absence (FR-023).
+7. **Active window and geometry are recorded.** An `activeWindowChange` event is emitted when the
+   frontmost window changes. Display geometry is stored as GeometrySegments alongside the
+   events, as a separate list in the same file.
+8. **Strict parsing.** Reading a stream rejects unknown kinds, timestamps that go backwards, and
+   events outside every GeometrySegment, rather than silently dropping them. Round-trip and
+   malformed-input tests cover each rule.
 
 ## Consumers
 
