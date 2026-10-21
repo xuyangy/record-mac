@@ -14,7 +14,10 @@ mixes audio, and never consults the edit document.
 
 `source` is one of: display, window, application, region, attached device (FR-001…FR-005).
 `options` carries microphone selection, system-audio on/off, camera selection, pointer
-inclusion, frame rate, and whether alpha is wanted.
+inclusion, frame rate, whether alpha is wanted, and whether to keep the Presenter Overlay
+composite as an extra track. Frame rate is one of 30, 60, 120, or 240; 240 is accepted only when
+the selected display reports a maximum of at least 240 frames per second, and is otherwise a
+*settings the hardware cannot produce at all* failure (FR-074).
 
 Returns a session, or fails with a reason the interface can show. Failure reasons must
 distinguish *permission missing*, *source unavailable*, *source already captured or camera
@@ -55,6 +58,18 @@ source has already disappeared.
 6. **Hardware encode.** H.264 and HEVC are encoded with hardware acceleration wherever the host
    provides it. Where it does not, the engine uses the software encoder and reports the
    reduction (Principle III, FR-071).
+7. **One clock for every source.** Screen, system audio, and microphone arrive from the same
+   ScreenCaptureKit stream and are stamped on the session's `CaptureClock`; the camera is mapped
+   onto it.
+8. **No padded frames.** Only frames delivered as complete are written. Idle intervals produce no
+   frame, and a frame that arrived complete but was not written counts as dropped (FR-074,
+   SC-002).
+9. **Presenter Overlay leaves the clean tracks alone.** While the overlay is engaged, the clean
+   screen stream still writes the `screen` track and the camera still writes the `camera` track.
+   The composited frames go only to the live preview and, when requested, the
+   `presenterComposite` track. If the system composites into every stream of the application,
+   the engine keeps the clean `screen` track, writes no composite, and reports Presenter Overlay
+   as reduced (FR-073, FR-071).
 
 ## Failure modes the caller must handle
 
@@ -67,3 +82,4 @@ source has already disappeared.
 | Disk full | Stop, keep what was written, report clearly |
 | Machine sleeps, locks, or switches user | Stop cleanly, keep footage, record `endReason`, tell the creator on return |
 | Another app holds the camera or is capturing the source | Fail at `prepare`, not at `start` |
+| Presenter Overlay turned on or off mid-recording | Continue; `screen` and `camera` tracks unbroken; the composite track starts or pauses with the overlay |

@@ -43,8 +43,9 @@ One captured stream, stored as captured.
 
 | Field | Type | Notes |
 |---|---|---|
-| `kind` | screen \| camera \| microphone \| systemAudio | |
+| `kind` | screen \| camera \| microphone \| systemAudio \| presenterComposite | |
 | `segments` | ordered list of MediaSegment | one per source device; see below |
+| `requestedFrameRate` | rate | video kinds only: 30, 60, 120, or 240 as chosen at `prepare` (FR-074) |
 | `endedEarlyAt` | optional time on `captureClock` | set when the device disconnected before stop |
 
 ### MediaSegment
@@ -58,7 +59,7 @@ One immutable media file, written in the format its device delivered.
 | `end` | time on `captureClock` | |
 | `deviceID` | text | the source device that produced it |
 | `nativeSize` | width x height | video kinds only |
-| `frameRate` | rate | video kinds only |
+| `frameRate` | rate | video kinds only; the rate the device actually delivered |
 | `hasAlpha` | boolean | video kinds only |
 
 **Invariants**
@@ -70,6 +71,11 @@ One immutable media file, written in the format its device delivered.
   new device's native size and frame rate. Segments are contiguous on `captureClock` and do not
   overlap. No frame is scaled, cropped, or re-encoded at capture; render scales each segment to
   the camera placement (Principle I).
+- A `presenterComposite` track exists only when the creator asked to keep the Presenter Overlay
+  composite, and only alongside a `screen` track and a `camera` track covering the same time.
+  It is never the source for render; it is an extra the creator may export as-is (FR-073).
+- A screen segment holds only frames ScreenCaptureKit delivered as complete; no frame is
+  duplicated to reach `requestedFrameRate` (FR-074).
 
 ## GeometrySegment
 
@@ -181,19 +187,27 @@ Named, reusable (FR-058).
 |---|---|---|
 | `name` | text | |
 | `container` | mp4 \| mov \| gif | |
-| `codec` | h264 \| hevc \| hevcWithAlpha | |
+| `codec` | h264 \| hevc \| hevcWithAlpha \| proRes422 \| proRes4444 | ProRes requires `mov` (FR-075) |
 | `resolution` | 480p … 4K preset, or `source` | `source` keeps the capture's pixel dimensions; all capped by capture and hardware (FR-053) |
 | `quality` | low \| medium \| high | |
-| `frameRate` | rate | GIF: 15/20/25/30 |
+| `frameRate` | rate, or `source` | video: up to the capture's rate, `source` keeps it (FR-074); GIF: 15/20/25/30 |
 | `colorHandling` | standard \| wide gamut | FR-054 |
 | `audioLayout` | separate \| mixed | export-time only (FR-019) |
 | `loop` | boolean | GIF only |
+
+**Validity**: a preset that breaks a rule below is rejected when saved and before export starts.
+
+| Container | Allowed codecs | Notes |
+|---|---|---|
+| `mp4` | h264, hevc | |
+| `mov` | h264, hevc, hevcWithAlpha, proRes422, proRes4444 | transparency needs `hevcWithAlpha` or `proRes4444` (FR-055, FR-075) |
+| `gif` | none | `codec`, `audioLayout`, and `colorHandling` do not apply; `loop` applies only here |
 
 ## Entity relationships
 
 ```text
 RecordingProject
-├── MediaTrack        (1..4, immutable)
+├── MediaTrack        (1..5, immutable)
 ├── ActivityEvent[]   (immutable, shares captureClock with MediaTrack)
 ├── GeometrySegment[] (immutable, shares captureClock with MediaTrack)
 └── EditDocument      (mutable)
