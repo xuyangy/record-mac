@@ -6,7 +6,7 @@
 
 **Status**: Draft
 
-**Input**: User description: "all features in https://github.com/imbhargav5/open-recorder https://github.com/lihaoyun6/QuickRecorder https://github.com/syi0808/screenize as long as supported by Intel T2 (2018+)"
+**Input**: User description: "all features in https://github.com/imbhargav5/open-recorder https://github.com/lihaoyun6/QuickRecorder https://github.com/syi0808/screenize on Apple Silicon Macs running macOS 15 or later"
 
 ## Overview
 
@@ -21,9 +21,9 @@ editor when wanted. It unifies three capability sets that today live in three se
 - **Input visualization**: on-screen keystroke badges and click ripples, and zoom that reacts
   to typing, scrolling, and dragging as well as to the pointer.
 
-Everything is scoped to what runs on the reference hardware: an Intel Mac with a T2 Security
-Chip (2018 or later) on macOS 14. Capabilities that require Apple Silicon are excluded from
-this feature and listed explicitly in Out of Scope.
+Everything is scoped to Apple Silicon Macs running macOS 15 or later. Intel Macs are not
+supported. Performance is measured on the reference machine, an M5 Pro MacBook Pro on
+macOS 27.
 
 ## User Scenarios & Testing *(mandatory)*
 
@@ -54,6 +54,11 @@ the camera is separable from the screen. Delivers a usable recording with zero e
    and capture, **Then** the preview degrades and the capture retains every frame.
 4. **Given** a completed recording, **When** the creator reopens it later, **Then** every
    adjustment remains changeable without re-recording.
+5. **Given** the camera is on and the creator turns on Presenter Overlay, **When** recording
+   completes, **Then** the project still contains the clean screen video and the separate
+   camera video.
+6. **Given** the creator picks 120 frames per second on a display that refreshes at 120 Hz,
+   **When** recording completes, **Then** the screen video holds 120 distinct frames per second.
 
 ---
 
@@ -199,8 +204,13 @@ from inside the application.
 - **Sensitive input**: typing into a secure field must never produce a badge.
 - **Very long recording** (multi-hour) must remain openable, seekable, and exportable.
 - **Very short recording** (under one second) must still produce a valid project.
-- **Hardware-gated capability absent**: a capability unavailable on this hardware must degrade
-  visibly, not disappear silently or block launch.
+- **Capability absent**: a capability unavailable on this Mac or this macOS version must
+  degrade visibly, not disappear silently or block launch.
+- **Frame rate above the display's refresh rate**: the source cannot deliver more distinct
+  frames than the display draws, so the recording must not pad itself with duplicate frames
+  and present them as real ones.
+- **Presenter Overlay turned on or off mid-recording** through the system's video effects
+  controls: the clean screen and camera recordings continue unbroken.
 - **Concurrent capture**: another application is already capturing the screen or holding the
   camera.
 
@@ -329,6 +339,8 @@ from inside the application.
   delivery side of FR-008).
 - **FR-057**: System MUST show export progress and allow cancellation.
 - **FR-058**: Users MUST be able to save and reuse export presets.
+- **FR-075**: System MUST export MOV in the ProRes 422 and ProRes 4444 professional
+  intermediate formats, with ProRes 4444 carrying the transparency channel when FR-055 applies.
 
 ### Functional Requirements — Library and Files
 
@@ -362,11 +374,21 @@ from inside the application.
 - **FR-069**: System MUST NOT make any network request in the course of recording, editing,
   or exporting.
 
+### Functional Requirements — Presenter Overlay and Frame Rate
+
+- **FR-073**: System MUST support the operating system's Presenter Overlay during recording,
+  so the creator sees themselves composited over the screen live. The clean screen recording
+  and the separate camera recording MUST still be captured in full. The composited result MAY
+  be kept as an additional recording, never in place of either.
+- **FR-074**: System MUST offer capture at 30, 60, and 120 frames per second, and at up to 240
+  where the source delivers that many distinct frames. Export MUST be able to keep the capture's
+  frame rate.
+
 ### Functional Requirements — Hardware Adaptation
 
-- **FR-070**: System MUST run fully on an Intel Mac with a T2 Security Chip from 2018 or later
-  running macOS 14.
-- **FR-071**: Where a capability depends on hardware the machine lacks, System MUST detect this
+- **FR-070**: System MUST run fully on any Apple Silicon Mac running macOS 15 or later.
+- **FR-071**: Where a capability depends on hardware or a macOS version the machine lacks,
+  System MUST detect this
   at startup or on use, substitute its own equivalent where one exists, and show the creator
   what is reduced. It MUST NOT refuse to launch or fail silently.
 - **FR-072**: System MUST warn before starting a recording whose settings exceed the frame-rate
@@ -398,7 +420,10 @@ from inside the application.
 - **SC-001**: A creator records a ten-minute tutorial and publishes a video that meets User
   Story 2 acceptance scenario 2 without opening any other application.
 - **SC-002**: A ten-minute recording at the reference machine's native display resolution loses
-  no more than 1% of frames, and the live preview causes none of that loss.
+  no more than 1% of frames at 60 and at 120 frames per second, and the live preview causes none
+  of that loss.
+- **SC-013**: With Presenter Overlay on for a ten-minute recording, the project still holds a
+  clean screen recording and a separate camera recording, each playable on its own.
 - **SC-003**: Starting a recording takes no more than three interactions from a cold start.
 - **SC-004**: A recording is ready to review within five seconds of being stopped.
 - **SC-005**: At least 80% of automatically placed zoom moves are kept unchanged by the creator
@@ -419,19 +444,9 @@ from inside the application.
 
 ## Out of Scope
 
-### Excluded because the reference hardware cannot support it
-
-- **Live system camera cutout overlay** (the operating system's presenter overlay): requires
-  Apple Silicon, as it depends on a neural processor absent from Intel Macs. The application's
-  own camera compositing covers the same finished output; what is lost is the real-time
-  see-through preview during recording, not the delivered result.
-- **Very high frame rate capture** beyond what the reference machine sustains. Capture above
-  60 frames per second is not promised. See Assumptions.
-- **Hardware-accelerated professional intermediate codec export**: available in software but
-  too slow to promise on this hardware; treated as reduced rather than absent.
-
 ### Excluded by choice
 
+- Intel Macs, and macOS versions before 15.
 - Multi-user accounts, licensing, server components, cloud rendering, and any hosted service.
 - Automatic updates, crash reporting, and usage analytics.
 - Localization beyond English.
@@ -459,7 +474,7 @@ license and attribution obligations the project constitution requires.
 | QuickRecorder | Transparency-channel output | FR-055 |
 | QuickRecorder | Pointer highlight, on-screen magnifier | FR-066 |
 | QuickRecorder | Menu bar presence, configurable global shortcuts | FR-063…FR-065 |
-| QuickRecorder | Live camera overlay (presenter overlay) | Out of Scope — hardware |
+| QuickRecorder | Live camera overlay (presenter overlay) | FR-073 |
 | Screenize | Keystroke badges, click ripples | FR-037…FR-041 |
 | Screenize | Activity-planned zoom (typing / scroll / drag) | FR-030 |
 | Screenize | Continuous pointer-following zoom with natural settling | FR-031 |
@@ -467,27 +482,31 @@ license and attribution obligations the project constitution requires.
 | Screenize | Keyframe visibility and manual adjustment | FR-047 |
 | Screenize | Undo / redo history | FR-048 |
 | Screenize | Color space choices, export presets | FR-054, FR-058 |
+| Screenize | ProRes 422 / 4444 export | FR-075 |
 | Screenize | Motion blur on fast transitions | FR-036 |
-| Screenize | High frame rate capture (to 240fps) | Out of Scope — hardware |
+| Screenize | High frame rate capture (to 240fps) | FR-074 |
 | Screenize | Six-language localization | Out of Scope — by choice |
 
 ## Assumptions
 
-- **Reference hardware** is the MacBook Pro 15-inch 2018 (Intel Core i7-8850H, 2880x1800
-  internal display) on macOS 14, as fixed by the project constitution. Capture resolution
-  targets that display natively; 4K arises only with an external 4K display attached.
-- **Frame rate** targets 30 and 60 frames per second. Screenize advertises up to 240fps, which
-  this hardware will not sustain alongside live preview and activity recording, so it is not
-  promised.
-- **Transparency-channel export is verified available** on the reference hardware, hardware
-  accelerated. The platform exposes a hardware muxed-alpha HEVC encoder; a compression session
-  that requires hardware acceleration is created successfully, and an encode-then-decode round
-  trip preserves transparent and opaque regions exactly. Acceptance testing for FR-055 must use
-  the platform decoder: some third-party decoders ignore the auxiliary alpha layer and render
-  the base layer as opaque, which looks like a broken export but is a property of those
-  decoders, not of the file.
-- **Continuity camera and desk view** availability on Intel hardware is assumed from operating
-  system support rather than verified; if absent, FR-010 degrades under FR-071.
+- **Reference hardware** is the MacBook Pro (Mac17,8) with an Apple M5 Pro, 48 GB memory, and a
+  3456x2234 built-in display, on macOS 27, as fixed by the project constitution. Capture
+  resolution targets that display natively; 4K and wider formats arise only with an external
+  display attached. Budgets met here are necessary, not sufficient, for slower Apple Silicon.
+- **Frame rate**: 120 frames per second is promised because the reference display refreshes at
+  up to 120 Hz. 240 is offered only where the source delivers that many distinct frames, and
+  otherwise falls under the FR-072 headroom warning rather than a promise.
+- **Presenter Overlay** is controlled by the creator through the operating system's video
+  effects controls, not by the application. Whether the system can deliver the clean screen and
+  the composited screen at the same time is to be established during planning; FR-073 holds
+  either way, and if only one can be delivered, the clean one is captured.
+- **Transparency-channel export** is expected to be hardware accelerated on Apple Silicon and is
+  to be confirmed on the reference machine. Acceptance testing for FR-055 must use the platform
+  decoder: some third-party decoders ignore the auxiliary alpha layer and render the base layer
+  as opaque, which looks like a broken export but is a property of those decoders, not of the
+  file.
+- **Continuity camera and desk view** availability is assumed from operating system support
+  rather than verified; if absent, FR-010 degrades under FR-071.
 - **Badges and ripples are rendered, not captured.** Screenize draws them on screen during
   recording; drawing them into the capture would violate the project's requirement that
   presentation effects stay reversible. They are therefore derived from recorded activity at
@@ -504,7 +523,7 @@ license and attribution obligations the project constitution requires.
 
 ## Dependencies
 
-- macOS 14 or later on the reference hardware, with its screen capture, camera, audio, and
+- macOS 15 or later on Apple Silicon, with its screen capture, camera, audio, and
   accessibility facilities.
 - Creator-granted operating system permissions: Screen Recording, Camera, Microphone, and
   Input Monitoring / Accessibility. Each capability degrades under FR-071 when its permission

@@ -49,16 +49,20 @@ None. All 16 items pass.
 
 ### Judgement calls recorded during validation
 
-- **Named platform capabilities**: Out of Scope names the operating system's presenter overlay,
-  and Assumptions names the three upstream projects and their licenses. These are scope and
+- **Named platform capabilities and formats**: FR-073 names the operating system's Presenter
+  Overlay, FR-075 names the ProRes 422 and 4444 formats, and Assumptions names the three
+  upstream projects and their licenses. These are user-visible features, delivery formats, and
   provenance constraints inherited from the request and the constitution, not implementation
   choices, so "no implementation details" is treated as passing. No framework, language, or
   interface is named anywhere in the requirements.
+- **Frame-rate promise**: FR-074 promises 120 frames per second, bounded by the reference
+  display's 120 Hz refresh, and offers 240 only where distinct frames exist, so SC-002 and US1
+  acceptance scenario 6 test a promise the reference machine can physically meet.
 - **Requirement tightening**: FR-031, FR-036, and FR-040 were rewritten during validation to
   replace subjective wording ("natural", "remain legible") with observable behaviour, so that
   each fails or passes a test unambiguously.
 - **Acceptance criteria coverage**: acceptance scenarios are attached to user stories rather
-  than to each of the 72 requirements individually. Every requirement traces to at least one
+  than to each of the 75 requirements individually. Every requirement traces to at least one
   story, and the Upstream Capability Coverage table gives the reverse mapping.
-- **Hardware-gated behaviour** is specified as a requirement (FR-071) rather than left to the
+- **Capability-gated behaviour** across Macs and macOS versions is specified as a requirement (FR-071) rather than left to the
   plan, so that degradation is testable rather than incidental.
