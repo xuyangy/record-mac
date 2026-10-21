@@ -12,14 +12,16 @@ camera layouts, presentation, and export. QuickRecorder supplies the capture eng
 supplies the activity-driven effect generators, their tests, and ProRes export settings.
 
 open-recorder's own recording path, `SCRecordingOutput`, is replaced by QuickRecorder's
-`SCStream` + `AVAssetWriter` engine. The reason is capability, not platform: the recording output
-mixes audio into its main file, is fixed to H.264 at 60 fps, and cannot pause, carry alpha, or
-expose the per-frame metadata Presenter Overlay needs (research.md R-001).
+`SCStream` + `AVAssetWriter` engine. The reason is capability on the macOS 15 floor, not
+platform: the recording output cannot keep the two audio sources apart before macOS 27, has no
+pause, and writes one file per recording where native-format segments are required (research.md
+R-001).
 
 ## Technical Context
 
 **Language/Version**: Swift 6.4 toolchain; the manifest declares swift-tools-version 6.2; the
-target compiles in Swift 5 language mode (research.md R-008)
+executable and test targets compile in Swift 5 language mode with strict-concurrency warnings
+(research.md R-008)
 
 **Primary Dependencies**: ScreenCaptureKit (screen, system audio, microphone, Presenter Overlay
 metadata), AVFoundation (camera, encode, mux), VideoToolbox (hardware H.264, HEVC, HEVC with
@@ -38,9 +40,10 @@ Apple M5 Pro, 48 GB, built-in display up to 120 Hz, macOS 27.0.1
 
 **Project Type**: Native macOS desktop application, single SwiftPM executable target
 
-**Performance Goals**: 10-minute capture at the built-in display's backing-store resolution, at
-60 and at 120 fps, with under 1% dropped frames; preview never the cause of a dropped capture
-frame; export of a 10-minute 1080p recording within 2x real time
+**Performance Goals**: 10-minute capture of the built-in display at its full 3456x2234 panel
+resolution, at 60 and at 120 fps, losing no more than 1% of the frames the display showed,
+measured end to end with a frame-ID fixture (research.md R-011); preview never the cause of a
+lost frame; export of a 10-minute 1080p recording within 2x real time
 
 **Constraints**: No outbound network calls in any path. Capture never rewritten by editing.
 Mic and system audio separate from capture through export. No keystroke from a secure field
@@ -57,7 +60,7 @@ Checked against constitution 2.0.0.
 
 | Principle | Gate | Status |
 |---|---|---|
-| I. Capture Fidelity | Capture written as captured; effects render-time only; mic/system audio never merged at capture; preview degrades before capture drops | **PASS by design.** Separate `AVAssetWriterInput`s for screen, mic, and system audio; camera segments kept at native format; Presenter Overlay on a second stream (R-009). |
+| I. Capture Fidelity | Capture written as captured; effects render-time only; mic/system audio never merged at capture; preview degrades before capture drops | **PASS by design, Presenter Overlay conditional.** Separate `AVAssetWriterInput`s for screen, mic, and system audio; screen and camera segmented at native format. Presenter Overlay passes only once Gate C's spike proves the clean stream stays clean (R-009). |
 | II. Stage Separation | Capture, Telemetry, Render separated by serializable contracts | **PASS by design.** Screenize's `UnifiedEvent` / `EventStreamAdapter` models telemetry as a serializable stream feeding pure generators. |
 | III. Native Stack First | First-party frameworks; hardware encode; runtime capability detection with fallback across Macs and macOS versions | **PASS.** All encoders are VideoToolbox, hardware on the reference machine with software fallback (R-006). |
 | IV. Local-Only | No analytics, crash reporting, update pings, or outbound calls | **FAIL in upstream — fixed by this plan.** See Gate B. |
@@ -76,21 +79,33 @@ binary references no network symbol, plus a source scan for `URLSession`, is add
 gate (see `quickstart.md`). No functional requirement depends on updating or captions; FR-068 and
 FR-069 forbid the first, and the spec puts the second out of scope.
 
-### Gate C — Presenter Overlay must not reach the clean tracks (open risk)
+### Gate C — Presenter Overlay must not reach the clean tracks (open, conditional)
 
 Principle I requires the clean screen track and the separate camera track even while the system
-composites the creator over the screen. The design captures two concurrent streams and writes the
-composite only to the preview and an optional extra track (R-009). Whether the system composite
-can be limited to one stream is unverified; a spike on the reference machine settles it before
-any other Presenter Overlay work. Either outcome passes this gate: the fallback keeps the clean
-stream and reports the reduction.
+composites the creator over the screen. The candidate design captures two concurrent streams and
+writes the composite only to the preview and an optional extra track (R-009). Whether a second
+stream stays clean through every transition is unverified.
+
+This gate stays open until the spike in R-009 runs on the reference machine, and no other
+Presenter Overlay work starts before it:
+
+- **Clean every frame**: the two-stream design is adopted and the gate passes.
+- **Composite reaches the clean stream**: the two-stream design is dropped. The application
+  draws its own live composite from the screen and camera, reports Presenter Overlay as reduced
+  before recording, and — because a creator can still turn the system effect on — marks every
+  overlaid stretch of the screen track and tells the creator. The gate passes on that fallback,
+  which the constitution permits since it allows Presenter Overlay but does not require it.
+
+In neither case is a composited frame dropped or cleaned after the fact; it is either kept out of
+the screen track or marked there.
 
 ### Post-Phase-1 re-check
 
-Re-evaluated after the design below. No new violations. Screenize's generators assume their own
-event model; an adapter at the telemetry boundary handles that, preserving their tests
-(Principle II, and the quality gate requiring automated tests for pure logic). Camera switching,
-Presenter Overlay, and ProRes export add tracks and codecs but no capture-time transform.
+Re-evaluated after the design below. No new violations; Gate C remains open as stated. Screenize's
+generators assume their own event model; an adapter at the telemetry boundary handles that,
+preserving their tests (Principle II, and the quality gate requiring automated tests for pure
+logic). Camera switching, screen size changes, Presenter Overlay, and ProRes export add
+segments, tracks, and codecs but no capture-time transform.
 
 ## Project Structure
 
@@ -164,5 +179,5 @@ not carried over; see research.md R-003.
 |---|---|---|
 | Three upstream codebases in one module | Each owns a distinct stage the feature needs, and the constitution fixes the baseline and derivation modes | Building one stage from scratch would discard Screenize's tested generators, which the quality gate requires be tested; splitting into SwiftPM modules would require rewriting upstream access levels across ~280 files before anything runs |
 | Swift 5 language mode on a Swift 6 toolchain | Screenize and QuickRecorder are Swift 5 code; one target has one mode | Swift 6 mode turns every strict-concurrency diagnostic in the vendored Swift 5 files into an error before anything runs |
-| Two concurrent screen streams while Presenter Overlay is on | Principle I keeps the clean screen and camera tracks while the system composites the creator | Writing the composite into the screen track, as QuickRecorder does, bakes the camera into the capture |
+| Two concurrent screen streams while Presenter Overlay is on (if Gate C's spike adopts it) | Principle I keeps the clean screen and camera tracks while the system composites the creator | Writing the composite into the screen track, as QuickRecorder does, bakes the camera into the capture |
 | Carrying QuickRecorder's third-party deps | KeyboardShortcuts backs FR-064 and FR-065; SwiftLAME backs MP3 under FR-021 | Reimplementing global hotkeys and an MP3 encoder is out of proportion to the feature, and both are recorded and license-checked in `UPSTREAM.md` |

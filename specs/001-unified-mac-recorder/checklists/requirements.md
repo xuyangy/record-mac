@@ -55,9 +55,13 @@ None. All 16 items pass.
   provenance constraints inherited from the request and the constitution, not implementation
   choices, so "no implementation details" is treated as passing. No framework, language, or
   interface is named anywhere in the requirements.
-- **Frame-rate promise**: FR-074 promises 120 frames per second, bounded by the reference
-  display's 120 Hz refresh, and offers 240 only where distinct frames exist, so SC-002 and US1
-  acceptance scenario 6 test a promise the reference machine can physically meet.
+- **Frame-rate promise**: FR-074 offers each rate only where the source refreshes at least that
+  fast, so SC-002 and US1 acceptance scenarios 6 and 7 test promises the reference machine can
+  physically meet: 120 on its built-in display, and neither 120 nor 240 on its 60 Hz external
+  display.
+- **Presenter Overlay outcome**: FR-073 states the required behaviour both when the system
+  composite can be kept out of the screen recording and when it cannot, so the requirement stays
+  testable before the measurement that decides which applies.
 - **Requirement tightening**: FR-031, FR-036, and FR-040 were rewritten during validation to
   replace subjective wording ("natural", "remain legible") with observable behaviour, so that
   each fails or passes a test unambiguously.

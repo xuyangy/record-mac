@@ -55,10 +55,13 @@ the camera is separable from the screen. Delivers a usable recording with zero e
 4. **Given** a completed recording, **When** the creator reopens it later, **Then** every
    adjustment remains changeable without re-recording.
 5. **Given** the camera is on and the creator turns on Presenter Overlay, **When** recording
-   completes, **Then** the project still contains the clean screen video and the separate
-   camera video.
-6. **Given** the creator picks 120 frames per second on a display that refreshes at 120 Hz,
-   **When** recording completes, **Then** the screen video holds 120 distinct frames per second.
+   completes, **Then** the project still contains the separate camera video, and either a clean
+   screen video or a screen video whose overlaid stretches are marked and were reported.
+6. **Given** the creator picks 120 frames per second on a display that refreshes at 120 Hz and
+   content that changes on every refresh, **When** recording completes, **Then** the screen
+   video holds every frame the display showed, within the SC-002 loss budget.
+7. **Given** a display that refreshes at 60 Hz, **When** the creator picks a frame rate,
+   **Then** 120 and 240 are not offered for that display.
 
 ---
 
@@ -210,7 +213,12 @@ from inside the application.
   frames than the display draws, so the recording must not pad itself with duplicate frames
   and present them as real ones.
 - **Presenter Overlay turned on or off mid-recording** through the system's video effects
-  controls: the clean screen and camera recordings continue unbroken.
+  controls: the camera recording continues unbroken, and the screen recording either stays clean
+  or has the overlaid stretch marked and reported. Switching between the overlay's small and
+  large modes is the same case.
+- **Screen size or pixel format changes mid-recording** (display reconfigured, window resized):
+  the screen recording continues in a new piece at the new size; nothing already captured is
+  rescaled.
 - **Concurrent capture**: another application is already capturing the screen or holding the
   camera.
 
@@ -376,13 +384,22 @@ from inside the application.
 
 ### Functional Requirements — Presenter Overlay and Frame Rate
 
-- **FR-073**: System MUST support the operating system's Presenter Overlay during recording,
-  so the creator sees themselves composited over the screen live. The clean screen recording
-  and the separate camera recording MUST still be captured in full. The composited result MAY
-  be kept as an additional recording, never in place of either.
-- **FR-074**: System MUST offer capture at 30, 60, and 120 frames per second, and at up to 240
-  where the source delivers that many distinct frames. Export MUST be able to keep the capture's
-  frame rate.
+- **FR-073**: System MUST support the operating system's Presenter Overlay during recording, so
+  the creator sees themselves composited over the screen live, wherever it can do so while the
+  screen recording stays free of the composite. The separate camera recording MUST be captured
+  in full in every case. The composited result MAY be kept as an additional recording, never in
+  place of the screen or camera recording. Where the screen recording cannot be kept free of the
+  composite, System MUST:
+  - report Presenter Overlay as reduced under FR-071 before recording starts;
+  - show the creator a live composite drawn by the application from the screen and camera
+    recordings instead;
+  - and, if the composite reaches the screen recording anyway, detect it, mark each affected
+    stretch in the project, tell the creator, and never present a marked stretch as clean.
+- **FR-074**: System MUST offer capture at 30 and 60 frames per second for every source, at 120
+  where the source refreshes at 120 Hz or more, and at 240 where it refreshes at 240 Hz or more.
+  A rate the source cannot deliver is not offered. A rate it can deliver but may not sustain is
+  offered with the FR-072 warning. The recording MUST NOT contain duplicated frames presented as
+  newly captured ones. Export MUST be able to keep the capture's frame rate.
 
 ### Functional Requirements — Hardware Adaptation
 
@@ -419,11 +436,12 @@ from inside the application.
 
 - **SC-001**: A creator records a ten-minute tutorial and publishes a video that meets User
   Story 2 acceptance scenario 2 without opening any other application.
-- **SC-002**: A ten-minute recording at the reference machine's native display resolution loses
-  no more than 1% of frames at 60 and at 120 frames per second, and the live preview causes none
-  of that loss.
-- **SC-013**: With Presenter Overlay on for a ten-minute recording, the project still holds a
-  clean screen recording and a separate camera recording, each playable on its own.
+- **SC-002**: A ten-minute recording of the reference machine's built-in display at its full
+  panel resolution of 3456x2234 pixels loses no more than 1% of the frames the display showed,
+  at 60 and at 120 frames per second, and the live preview causes none of that loss.
+- **SC-013**: With Presenter Overlay on for a ten-minute recording, the project holds a separate
+  camera recording playable on its own, and a screen recording that is either clean throughout
+  or has every overlaid stretch marked; no overlaid frame is presented as clean.
 - **SC-003**: Starting a recording takes no more than three interactions from a cold start.
 - **SC-004**: A recording is ready to review within five seconds of being stopped.
 - **SC-005**: At least 80% of automatically placed zoom moves are kept unchanged by the creator
@@ -490,16 +508,19 @@ license and attribution obligations the project constitution requires.
 ## Assumptions
 
 - **Reference hardware** is the MacBook Pro (Mac17,8) with an Apple M5 Pro, 48 GB memory, and a
-  3456x2234 built-in display, on macOS 27, as fixed by the project constitution. Capture
-  resolution targets that display natively; 4K and wider formats arise only with an external
-  display attached. Budgets met here are necessary, not sufficient, for slower Apple Silicon.
-- **Frame rate**: 120 frames per second is promised because the reference display refreshes at
-  up to 120 Hz. 240 is offered only where the source delivers that many distinct frames, and
-  otherwise falls under the FR-072 headroom warning rather than a promise.
+  3456x2234 built-in display, on macOS 27, as fixed by the project constitution. The built-in
+  panel's 3456x2234 pixels are reached in the display mode that looks like 1728x1117; SC-002 is
+  measured in that mode, and other scaled modes capture fewer pixels. 4K and wider formats arise
+  only with an external display attached. Budgets met here are necessary, not sufficient, for
+  slower Apple Silicon.
+- **Frame rate**: the reference built-in display refreshes at up to 120 Hz and the attached
+  external display at 60 Hz, so the reference machine offers 120 for the first and not the
+  second. No attached display refreshes at 240 Hz, so the 240 path is reached only through
+  forced capability detection on the reference machine.
 - **Presenter Overlay** is controlled by the creator through the operating system's video
-  effects controls, not by the application. Whether the system can deliver the clean screen and
-  the composited screen at the same time is to be established during planning; FR-073 holds
-  either way, and if only one can be delivered, the clean one is captured.
+  effects controls, not by the application. Whether the system composite can be kept out of the
+  screen recording is to be established by measurement on the reference machine; FR-073 states
+  the required behaviour for both outcomes.
 - **Transparency-channel export** is expected to be hardware accelerated on Apple Silicon and is
   to be confirmed on the reference machine. Acceptance testing for FR-055 must use the platform
   decoder: some third-party decoders ignore the auxiliary alpha layer and render the base layer

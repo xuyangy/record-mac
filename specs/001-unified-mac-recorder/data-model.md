@@ -16,10 +16,12 @@ The unit the library lists and the editor opens. One directory on disk.
 | `formatVersion` | integer | drives migration (FR-062) |
 | `displayName` | text | user-editable, defaults from creation time |
 | `createdAt` | timestamp | |
-| `sourceDuration` | time interval | derived from the longest media track; the captured length |
+| `sourceDuration` | time interval | derived from the screen, camera, and audio tracks; the captured length. `presenterComposite` never extends it |
 | `captureClock` | clock reference | the single time base all tracks and events share |
 | `pauses` | list of time ranges | wall-clock intervals excluded from `captureClock` while paused |
 | `endReason` | completed \| sourceLost \| permissionRevoked \| diskFull \| sleepOrLock \| userSwitch | why capture stopped |
+| `overlaidRanges` | list of time ranges | stretches where the system Presenter Overlay composite reached the `screen` track; empty when it never did (FR-073) |
+| `frameReport` | delivered, append-rejected, writer-failed, and written counts for the screen track | written once at stop (FR-074, SC-002) |
 | `sourceDescription` | text | what was recorded: display, window, application, region, device |
 | `mediaTracks` | list of MediaTrack | immutable |
 | `activityStream` | reference to ActivityEvent sequence | immutable |
@@ -66,21 +68,29 @@ One immutable media file, written in the format its device delivered.
 
 - `microphone` and `systemAudio` are always distinct tracks; no capture-time mixing (FR-017).
 - A project has at most one track of each kind.
-- `screen`, `microphone`, and `systemAudio` tracks have exactly one segment.
-- Switching camera mid-recording ends the current `camera` segment and starts a new one at the
-  new device's native size and frame rate. Segments are contiguous on `captureClock` and do not
-  overlap. No frame is scaled, cropped, or re-encoded at capture; render scales each segment to
-  the camera placement (Principle I).
+- Segments of one track are ordered on `captureClock` and never overlap. A gap between
+  segments is stored as a gap; no frame or sample is synthesised to close it.
+- A `screen` track starts a new segment whenever the source's pixel size or pixel format
+  changes. A `camera` track starts a new segment on each camera switch, at the new device's
+  native size and frame rate. No frame is scaled, cropped, or re-encoded at capture; render maps
+  each segment to the output (Principle I).
+- `microphone` and `systemAudio` tracks start a new segment only if the audio format changes.
 - A `presenterComposite` track exists only when the creator asked to keep the Presenter Overlay
-  composite, and only alongside a `screen` track and a `camera` track covering the same time.
-  It is never the source for render; it is an extra the creator may export as-is (FR-073).
-- A screen segment holds only frames ScreenCaptureKit delivered as complete; no frame is
-  duplicated to reach `requestedFrameRate` (FR-074).
+  composite and the two-stream design is in use. It has one segment per stretch the overlay was
+  on, alongside a `screen` and a `camera` track covering the same time. It is never the source
+  for render; it is an extra the creator may export as-is (FR-073).
+- A screen segment holds only frames ScreenCaptureKit delivered as `complete`; no frame is
+  duplicated to reach `requestedFrameRate`. An idle interval extends the previous frame's
+  duration (FR-074).
+- Every time in `overlaidRanges` lies within the `screen` track. Render and export present those
+  stretches as overlaid, never as clean.
 
 ## GeometrySegment
 
-The capture source's geometry over one span of time. A new segment starts whenever the display
-is reconfigured mid-recording, so render can letterbox and map pointer coordinates correctly.
+The capture source's geometry over one span of time. A new segment starts whenever the
+captured area moves or changes size — the display is reconfigured, or a recorded window or
+application window moves or resizes — so render can letterbox and map pointer coordinates
+correctly. A screen media segment boundary is always also a GeometrySegment boundary.
 
 | Field | Type | Notes |
 |---|---|---|
@@ -169,15 +179,21 @@ strength. All from FR-026 through FR-036.
 
 | Field | Type | Notes |
 |---|---|---|
-| `sourceEventRef` | reference to an ActivityEvent | |
+| `sourceEventRefs` | non-empty ordered list of ActivityEvent references | one for a ripple; one or more for a badge that combines keys (FR-040) |
 | `kind` | keystrokeBadge \| clickRipple | |
 | `timeRange` | time range | |
 | `appearance` | position, size, duration | FR-039 |
 | `suppressed` | boolean | user turned this one off |
 
-**Invariant**: an overlay exists only as a function of an ActivityEvent. It is never captured,
-always rendered (FR-037, and the spec's assumption that departs from Screenize's on-screen
-drawing).
+**Invariants**
+
+- An overlay exists only as a function of its ActivityEvents. It is never captured, always
+  rendered (FR-037, and the spec's assumption that departs from Screenize's on-screen drawing).
+- A combined badge stays visible for at least 0.8 seconds after the last key added to it, so a
+  key added late is never shown for less than that (FR-040).
+- A combined badge shows at most its six most recent entries; older entries leave the badge as
+  new ones arrive, but stay in `sourceEventRefs`. Its `timeRange` ends no later than the end of
+  the clip that contains its last key.
 
 ## ExportPreset
 

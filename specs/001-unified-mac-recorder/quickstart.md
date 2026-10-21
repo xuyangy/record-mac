@@ -61,21 +61,30 @@ swift test --filter 'ProjectFormatTests|ProjectMigrationTests|AutosaveAtomicityT
 Then by hand:
 
 1. Record 10 minutes with camera, microphone, and system audio on.
-2. Confirm `media/` holds `screen.mov`, `camera-1.mov`, `microphone.m4a`, and `system.m4a` as
-   separate files.
+2. Confirm `media/` holds `screen-1.mov`, `camera-1.mov`, `microphone.m4a`, and `system.m4a`
+   as separate files, and that `project.json` lists each with its segment times.
 3. Note the hash of each media file: `shasum media/*`.
 4. Edit heavily — split, change speed, move zooms, restyle the background — then export.
 5. Re-run `shasum media/*`. **Every hash must be unchanged.** A changed hash fails Principle I.
 
-## Gate 3 — Dropped frames (SC-002)
+## Gate 3 — Lost frames (SC-002)
 
-Record 10 minutes on the built-in display with preview visible, once at 60 fps and once at
-120 fps, with content that changes every frame (a playing video or a scrolling page). The app
-must report its own dropped-frame count. A dropped frame is one delivered complete but not
-written; idle intervals are not drops (research.md R-011). Record the display mode used, as
-"native" means the backing-store size of the current mode.
+Measured end to end against what the display showed, not only against what the app saw
+(research.md R-011).
 
-- Pass: under 1% dropped at each rate, and no drop attributable to preview.
+1. Switch the built-in display to the mode that looks like 1728x1117, so its backing store is
+   the full 3456x2234 panel.
+2. Run the frame-ID fixture: a test animation that draws a frame number on every display
+   refresh, with the frame numbers actually shown logged at the display as the baseline.
+3. Record 10 minutes of the fixture with preview visible, once at 60 fps and once at 120 fps.
+4. Decode each finalised screen track and read back the frame numbers.
+
+Record, for each run: panel pixels, source pixels, and the stream output size read from the
+frames; the display mode; and the four engine counters — delivered, append-rejected,
+writer-failed, written.
+
+- Pass: at each rate, no more than 1% of the frame numbers the display showed are missing from
+  the decoded file, and no loss is attributable to preview.
 - Fail: anything higher. The reference machine is the fastest supported Mac, so a pass here is
   necessary, not sufficient, for slower Apple Silicon.
 
@@ -109,10 +118,14 @@ Screenize's generator tests are carried across and must keep passing with their 
 unmodified:
 
 ```bash
-SUITES='SpringDamperSimulator|WaypointGenerator|AdaptiveResponse|MicroTracker|DeadZoneTarget|StartupCameraPolicy|SegmentPlanner|SegmentSpringSimulator|ShotPlanner|IntentClassifier|EventTimeline|EventStreamAdapter'
-swift test list | grep -cE "$SUITES"   # must be greater than zero, or the filter ran nothing
-swift test --filter "$SUITES"
+scripts/check-generator-suites.sh
 ```
+
+The script fails unless every one of these suites appears in `swift test list` and then passes:
+`SpringDamperSimulator`, `WaypointGenerator`, `AdaptiveResponse`, `MicroTracker`,
+`DeadZoneTarget`, `StartupCameraPolicy`, `SegmentPlanner`, `SegmentSpringSimulator`,
+`ShotPlanner`, `IntentClassifier`, `EventTimeline`, `EventStreamAdapter`. A missing suite is a
+failure, so a partial import cannot pass on a nonzero count.
 
 A failure is first investigated at the telemetry adapter, which is the usual cause. Import and
 module wiring in a vendored test may change; its assertions may not.
@@ -129,40 +142,64 @@ module wiring in a vendored test may change; its assertions may not.
 On the reference machine, exercise each fallback path and confirm the app launches, names the
 reduced capability, and still produces the output. The reference machine has every capability,
 so each fallback is reached by forcing capability detection to report it absent, as the
-constitution requires:
+constitution requires. For encoders, forcing the report is not enough: the fallback must
+actually select the software encoder, and the check inspects the encode session and decodes the
+output (research.md R-006):
 
 | Capability | Reduced when | Expected result |
 |---|---|---|
 | Alpha encode | encoder unavailable | export states no transparency, never silent opaque output |
-| Hardware H.264/HEVC/ProRes | encoder unavailable | software encode used and named |
-| 240 fps | display maximum below 240 | 240 not offered, or refused at `prepare` with a reason |
+| Hardware H.264/HEVC/ProRes | encoder unavailable | software encoder confirmed in the session, output decodes, reduction named |
+| 120 and 240 fps | source refresh below the rate | rate not offered; requesting it anyway is refused at `prepare` with a reason |
 | Frame-rate headroom | settings exceed it | FR-072 warning shown; recording may proceed |
-| Presenter Overlay composite | system composites every stream | clean screen kept, no composite track, reduction named |
+| Presenter Overlay | spike found the composite reaches the clean stream | reduction named before recording; app-drawn live composite shown; overlaid stretches marked if the effect is turned on |
 | Each permission | not granted | capability named, route to System Settings offered |
 
 Also confirm the full-capability branch is taken with nothing forced. Nothing may fail silently,
 and the app must never refuse to launch.
 
-## Gate 9 — Presenter Overlay keeps the clean tracks (FR-073, SC-013)
+## Gate 9 — Presenter Overlay never presents a composite as clean (FR-073, SC-013)
+
+Run after the Presenter Overlay spike in research.md R-009, on whichever branch it selected.
 
 1. Turn on the camera and keep the composite track.
 2. Start a 10-minute recording. Turn Presenter Overlay on from the system video effects
    controls, switch between its small and large modes, and turn it off again.
-3. Open `media/`. `screen.mov` must show no camera anywhere. `camera-1.mov` must play on its own
-   for the whole recording. `presenter-composite.mov` must show the overlay while it was on.
+3. Open the project.
 
-## Gate 10 — Frame rate is real (FR-074)
+On both branches:
+
+- `camera-1.mov` plays on its own for the whole recording.
+- Every screen frame is checked, not a sample. A frame showing the composite lies inside one of
+  `project.json`'s `overlaidRanges`, and the creator was told when it happened.
+
+On the two-stream branch, additionally:
+
+- `overlaidRanges` is empty and no screen frame shows the composite.
+- `presenter-composite-N.mov` files cover exactly the stretches the overlay was on, and
+  `sourceDuration` is unchanged by them.
+
+On the fallback branch, additionally:
+
+- Presenter Overlay was reported as reduced before recording started.
+- The live preview showed the application's own composite.
+- No `presenter-composite-N.mov` exists.
+
+## Gate 10 — Frame-rate offers and output are real (FR-074)
 
 ```bash
 swift test --filter FrameRateTests
 ```
 
-Then by hand, on the built-in 120 Hz display with content changing every frame:
+Then by hand:
 
-1. Record 30 seconds at 120 fps. The screen track averages 120 distinct frames per second,
-   within the Gate 3 drop budget, and no two consecutive frames are byte-identical copies.
-2. Confirm 240 is not offered for this display.
-3. Export with frame rate `source`; the exported file reports 120 fps.
+1. On the built-in 120 Hz display, 120 is offered and 240 is not. On the attached 60 Hz display,
+   neither is offered.
+2. Record 30 seconds of the Gate 3 frame-ID fixture at 120 fps. The decoded screen track holds
+   the shown frame numbers within the Gate 3 budget, each exactly once.
+3. Record 30 seconds of a static screen. The screen track has few frames, and its total duration
+   still equals the recording's length.
+4. Export with frame rate `source`; the exported file reports 120 fps.
 
 ## End-to-end acceptance
 
@@ -180,20 +217,20 @@ closes it.
 | Item | Phase | Fixture | Method | Pass rule |
 |---|---|---|---|---|
 | SC-001 | 9 | 10-min tutorial | end-to-end pass above | export meets US2 scenario 2; no other app opened |
-| SC-002 / Gate 3 | 3, 9 | 10-min native capture at 60 and 120 fps, preview on | app's dropped-frame count | ≤ 1% at each rate, none from preview |
+| SC-002 / Gate 3 | 3, 9 | frame-ID fixture, 10 min at 3456x2234, 60 and 120 fps, preview on | decoded frame numbers vs display baseline | ≤ 1% lost at each rate, none from preview |
 | SC-003 | 9 | cold start, permissions granted | count interactions to recording | ≤ 3 |
 | SC-004 | 9 | 10-min recording | time from stop to editor ready | ≤ 5 s |
 | SC-005 | 9 | fixed click-driven corpus recording | owner reviews generated zooms | unchanged / total ≥ 80% |
 | SC-006 | 9 | 10-min corpus recording | time 1080p H.264 export, high quality, default effects | ≤ 20 min |
-| SC-007 | 5 | corpus recording | toggle every derived effect off and on | each changes without re-recording |
+| SC-007 | 6, 9 | corpus recording | change and remove every derived effect — zoom, cursor, badges, ripples — reopen, re-export | each changes without re-recording; media hashes unchanged |
 | SC-008 | 7 | two-audio recording | inspect delivered file tracks | mic and system audio separate in every multi-track path |
 | SC-009 / Gate 5 | 2, 9 | synthetic stream + hand test | tests + login, `sudo`, Keychain | no secure key in any output |
 | SC-010 / Gate 1 | 1, 9 | full cycle | `nm`, `otool`, `nettop` | zero outbound connections |
 | SC-011 / Gate 8 | 9 | — | fallback table above | every reduction named |
 | SC-012 | 2 | fixture per format version | migration tests | every version opens |
-| SC-013 / Gate 9 | 3, 9 | 10-min recording, overlay toggled | inspect `media/` | clean screen and camera intact |
+| SC-013 / Gate 9 | 3, 9 | 10-min recording, overlay toggled | check every screen frame and `overlaidRanges` | camera intact; no composited frame outside `overlaidRanges` |
 | Gate 2 | 2, 3 | 10-min recording | tests + hashes | hashes unchanged |
 | Gate 4 | 7 | alpha and ProRes export | `AlphaExportTests`, `ProResExportTests` | alpha preserved by platform decoder |
 | Gate 6 | 2 | vendored suites | command above | nonzero count, all pass |
 | Gate 7 | 4 | click-heavy recording | regenerate after manual edit | manual move unchanged |
-| Gate 10 | 3, 7 | 30-s capture at 120 fps | `FrameRateTests` + frame count | 120 distinct fps, exported at source rate |
+| Gate 10 | 3, 7 | offers per display; 30-s fixture at 120 fps; static screen | `FrameRateTests` + decoded frame numbers | offers match refresh; shown frames present once; duration kept; exported at source rate |

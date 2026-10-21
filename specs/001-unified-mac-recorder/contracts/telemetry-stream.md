@@ -34,7 +34,8 @@ recorder (R-004).
 6. **Targeting is optional.** `target` is populated where Accessibility exposes it and absent
    otherwise. Generators must tolerate its absence (FR-023).
 7. **Active window and geometry are recorded.** An `activeWindowChange` event is emitted when the
-   frontmost window changes. Display geometry is stored as GeometrySegments alongside the
+   frontmost window changes. Source geometry — display reconfiguration, and a recorded window
+   or application window moving or resizing — is stored as GeometrySegments alongside the
    events, as a separate list in the same file.
 8. **Strict parsing.** Reading a stream rejects unknown kinds, timestamps that go backwards, and
    events outside every GeometrySegment, rather than silently dropping them. Round-trip and

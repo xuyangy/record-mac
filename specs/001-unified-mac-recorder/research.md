@@ -11,32 +11,43 @@ branch on 2026-10-21; pinned revisions are in R-010. The reference machine is a 
 `SCStream` + `AVAssetWriter` engine. The deployment target is `.macOS(.v15)`, matching both
 open-recorder's manifest and the constitution's floor, so no version gate is involved.
 
-**Evidence**: open-recorder's `NativeScreenRecorder.swift` writes the screen with an
-`SCRecordingOutputConfiguration` fixed to `outputFileType = .mp4` and `videoCodecType = .h264`,
-with `minimumFrameInterval` fixed at 1/60 s. Its own comment states that `SCRecordingOutput`
-combines audio internally; separate microphone and system audio are recovered only by extra
-sidecar stream outputs written next to the mixed file. The recording output has no pause.
+**Evidence**: open-recorder's `NativeScreenRecorder.swift` (pinned revision) configures its
+`SCRecordingOutputConfiguration` with `outputFileType = .mp4` and `videoCodecType = .h264`
+(lines 60-63) and sets the stream's `minimumFrameInterval` to 1/60 s (line 127). Its comment at
+lines 81-89 states that the recording output combines audio internally, and it adds separate
+microphone and system-audio `SCStreamOutput`s to write sidecar files next to the mixed one. It
+also adds a `.screen` `SCStreamOutput` beside the recording output (lines 77-78) to observe
+frames.
+
+These are upstream's choices, not all of them API limits. In the macOS SDK:
+`SCRecordingOutputConfiguration` exposes `availableVideoCodecTypes` and
+`availableOutputFileTypes`, so other codecs and containers can be chosen; the frame interval
+belongs to `SCStreamConfiguration`, not to the recording output; and
+`mixesAudioWithMicrophone = NO`, which keeps the two audio sources as separate tracks, is
+available only from macOS 27. The recording output has no pause in any version.
 
 QuickRecorder appends sample buffers itself: separate `AVAssetWriterInput`s for screen,
-microphone, and system audio on one `AVAssetWriter`, a frame-rate setting passed to
-`minimumFrameInterval`, `AVVideoCodecType.hevcWithAlpha` for transparency, and pause handled
-by offsetting timestamps.
+microphone, and system audio on one `AVAssetWriter` (`RecordEngine.swift:332-334, 421-432`),
+`AVVideoCodecType.hevcWithAlpha`, and pause handled by offsetting timestamps (lines 552-555).
 
-**Rationale**: the replacement is no longer about the deployment target. It is required by what
-`SCRecordingOutput` cannot do:
+**Rationale**: the comparison that decides it is pinned upstream behaviour, and the API on the
+macOS 15 floor, against the chosen engine:
 
-| Requirement | `SCRecordingOutput` | Sample-buffer engine |
-|---|---|---|
-| Principle I, FR-017: no capture-time mixing | mixes into the main file | separate inputs only |
-| FR-055: transparency at capture | H.264 MP4 only | `hevcWithAlpha` |
-| FR-074: 120 and 240 fps | fixed 1/60 s in upstream; no per-frame control | interval and per-frame status visible |
-| Contract: pause / resume | none | timestamp offset |
-| Principle I: preview drops before capture | opaque internal queue | engine decides which frames to drop |
-| FR-073: Presenter Overlay frame metadata | not exposed | `presenterOverlayContentRect` per frame |
+| Requirement | Upstream `SCRecordingOutput` path | API on macOS 15 | Sample-buffer engine |
+|---|---|---|---|
+| Principle I, FR-017: no capture-time mixing | mixes into the main file | mixing cannot be turned off before macOS 27 | separate inputs only |
+| Native-format assets per segment (camera switch, screen size change) | one file per recording | one file per recording output | one writer per segment |
+| FR-074: 120 and 240 fps | 1/60 s | interval is set on the stream; any rate | same, with per-frame status in the writer path |
+| Contract: pause / resume | none | none | timestamp offset |
+| Principle I: preview yields before capture | separate observer output | recording queue not visible | engine decides what to shed |
+| FR-055, FR-075: alpha and ProRes masters | H.264 MP4 | codec list is device-dependent | any `AVAssetWriter` codec |
+
+One custom pipeline gives explicit scheduling, pause, separate native assets, and backpressure
+on the macOS 15 floor.
 
 **Alternatives considered**:
-- *Keep `SCRecordingOutput` and use the sidecar audio files.* Leaves a mixed main file that the
-  constitution forbids producing at capture, and fails FR-055, FR-074, and pause.
+- *Keep `SCRecordingOutput` and use the sidecar audio files.* Leaves a mixed main file before
+  macOS 27, has no pause, and writes one file per recording where segments are required.
 - *Keep both paths behind a flag.* Two capture paths double the surface that Principle I's
   fidelity rules must hold across, for no capability gain.
 
@@ -112,8 +123,18 @@ every supported host. open-recorder already uses it. QuickRecorder's `RecordEngi
 creates `micInput` and `awInput` as distinct `AVAssetWriterInput`s on one writer.
 
 **Rationale**: microphone buffers arrive as `SCStreamOutputType.microphone` on the same stream
-and clock as the screen, which removes a separate capture session and its clock alignment. The
-separate writer inputs satisfy Principle I and FR-017 directly.
+as the screen, which removes a separate capture session. The separate writer inputs satisfy
+Principle I and FR-017 directly.
+
+Delivery on one stream does not by itself align the tracks. Alignment is an obligation the engine
+meets and tests: every buffer keeps its own presentation timestamp, every track maps onto one
+session epoch, and callback arrival time is never used as a timestamp. A test measures offsets
+and drift across screen, microphone, system audio, and camera, including after a pause. This
+applies to ScreenCaptureKit sources; an attached mobile device is captured through another
+native source and is mapped onto the same epoch by the same rule.
+
+QuickRecorder's handler does not write `.microphone` buffers, since its microphone came from
+`AECAudioStream`; the adapted engine adds that writer path.
 
 **Alternatives considered**: *QuickRecorder's `AECAudioStream` echo-cancelled microphone.* No
 requirement calls for echo cancellation, and it would bring a second audio clock and a
@@ -121,19 +142,34 @@ third-party dependency. Not carried.
 
 ## R-006: Hardware encoders on the reference machine
 
-**Decision**: H.264, HEVC, HEVC with alpha, ProRes 422, and ProRes 4444 are all hardware encoded
-on the reference machine. Encoder selection still detects hardware at runtime and falls back to
-the software encoder, naming the reduction (Principle III, FR-071).
+**Decision**: Encoder selection detects hardware at runtime per codec and per output format, and
+falls back to the software encoder, naming the reduction (Principle III, FR-071). Selection is
+proven by encoding, not by listing.
 
-**Evidence**: `VTCopyVideoEncoderList` on the reference machine reports hardware encoders for
+**Evidence**: `VTCopyVideoEncoderList` on the reference machine lists hardware encoders for
 `avc1` (H.264), `hvc1` (HEVC), `muxa` (Apple Muxed Alpha HEVC), `apcn`/`apch`/`apcs`/`apco`
-(ProRes 422 family), and `ap4h`/`ap4x` (ProRes 4444 family). Software encoders for each are also
-present, which is the fallback branch.
+(ProRes 422 family), and `ap4h`/`ap4x` (ProRes 4444 family), and a software encoder for each.
 
-**Caveat carried into testing**: third-party decoders that ignore Apple's auxiliary alpha layer
-report a correct HEVC-with-alpha file as fully opaque. Acceptance tests for FR-055 must decode
-with the platform decoder. The fallback branch is exercised by forcing detection to report the
-hardware encoder absent, as the constitution requires.
+An inventory entry shows an encoder exists. It does not show that an encode succeeds at a given
+size, frame rate, pixel format, and alpha mode, nor that a particular writer picked hardware.
+Detection therefore creates a compression session with
+`RequireHardwareAcceleratedVideoEncoder = true` for the exact acceptance format, reads back
+`UsingHardwareAcceleratedVideoEncoder`, and records the encoder ID and OS version.
+
+**Fallback testing**: forcing the detector to report hardware absent is not enough, because an
+`AVAssetWriter` may still pick hardware on its own. The fallback path sets
+`EnableHardwareAcceleratedVideoEncoder = false`, and its test inspects the session to confirm a
+software encoder ran and decodes the output. A software encode that fails is a visible error,
+not a silent one.
+
+**Alpha**: third-party decoders that ignore Apple's auxiliary alpha layer report a correct
+HEVC-with-alpha file as fully opaque. Acceptance tests for FR-055 decode with the platform
+decoder.
+
+**Limit**: no macOS 15 host and no slower Apple Silicon Mac is available. API availability on
+macOS 15 is checked by building with that deployment target and its availability annotations;
+behaviour and performance on macOS 15 and slower Macs are unverified, which the constitution
+already treats as a known gap of the reference-machine budget.
 
 ## R-007: Suppressing keystrokes from secure fields
 
@@ -156,7 +192,8 @@ event stream.
 ## R-008: One module, and its language mode
 
 **Decision**: One SwiftPM executable target. Rename colliding files on import. Compile the
-target in Swift 5 language mode with the Swift 6 toolchain.
+executable target and its test target in Swift 5 language mode with the Swift 6 toolchain,
+with strict-concurrency checking enabled as warnings.
 
 **Evidence**: The two non-test file-name collisions across the three projects are
 `ContentView.swift` and `PreviewView.swift`. Screenize's Xcode project sets `SWIFT_VERSION = 5.0`;
@@ -164,39 +201,66 @@ QuickRecorder is also Swift 5 code. open-recorder's manifest uses swift-tools-ve
 builds in Swift 6 language mode by default. The installed toolchain is Swift 6.4.
 
 **Rationale**: a target has one language mode. Swift 6 mode would turn every strict-concurrency
-diagnostic in ~200 Swift 5 files into an error before anything runs. Swift 5 mode accepts all
-three codebases. Splitting into modules to give each its own mode would require auditing access
-levels across those files first, a much larger cost.
+diagnostic in the vendored Swift 5 code into an error before anything runs. Swift 5 mode is
+expected to accept all three codebases; the first merged build confirms it. Splitting into
+modules to give each its own mode would require auditing access levels across those files
+first, a much larger cost.
 
-**Alternatives considered**: *Swift 6 mode with per-file fixes.* Deferred, not rejected:
-strict-concurrency adoption can proceed file by file later without changing the structure.
+Swift tools version (6.2, the manifest format) and language mode (5, how sources compile) are
+separate settings. Strict-concurrency warnings stay visible: races in shared capture, clock,
+and writer state are fixed as they surface, and actor-isolation and runtime checks are never
+suppressed wholesale.
+
+**Alternatives considered**: *Swift 6 mode now.* Deferred, not rejected: once the warnings are
+cleared the target's mode can be raised to 6 in one manifest change.
 
 ## R-009: Presenter Overlay
 
-**Decision**: Support Presenter Overlay with two concurrent screen streams over the same content
-filter: a clean stream written to the `screen` track, and an overlay stream that receives the
-system composite. The overlay stream feeds the live preview and, when the creator asks, an
-additional `presenterComposite` track. If the reference machine shows that the system composites
-into every stream of the application, the clean stream wins, Presenter Overlay is reported as
-reduced under FR-071, and FR-073's live view is provided by the application's own camera
-preview instead.
+**Decision**: Treat clean Presenter Overlay support as unproven until a spike on the reference
+machine measures it, and design for both outcomes.
+
+- *Candidate design*: two concurrent screen streams over the same content filter. The clean
+  stream writes the `screen` track; the overlay stream receives the system composite and feeds
+  the live preview and, when the creator asks, the `presenterComposite` track. Audio is taken
+  from the clean stream only. Both streams map onto the session epoch. The composite path has a
+  bounded queue and is shed before any clean-stream work.
+- *Fallback*: one clean stream, and a live composite drawn by the application from the screen
+  and camera for the creator to watch. Presenter Overlay is reported as reduced under FR-071
+  before recording starts.
+- *Unexpected activation*: the clean stream carries `presenterOverlayContentRect` on every frame.
+  When that attachment shows the overlay engaged on the clean stream, the engine keeps writing
+  every frame, records the affected time range in the project, and tells the creator. Dropping
+  those frames instead would break capture continuity and the frame budget, and a composited
+  frame cannot be cleaned after the fact.
 
 **Evidence**: Presenter Overlay is a system video effect that the creator turns on from the
 operating system's video effects controls while the application uses the camera. The system
 composites the creator into captured screen frames and marks each frame with
 `SCStreamFrameInfo.presenterOverlayContentRect` (macOS 14.2+). QuickRecorder reads that
-attachment to detect the overlay state ("OFF", "Small", "Big") and, while the overlay engages,
-holds frames for a short safety delay. QuickRecorder writes the composited frames into its only
-screen track.
+attachment to classify the overlay as off, small, or large. While the overlay engages it
+discards complete frames for a short safety delay (`RecordEngine.swift:594-596`,
+`if isPresenterON && !isCameraReady { break }`) and writes the composited frames into its only
+screen track. Neither behaviour is carried over: the first drops capture frames and the second
+bakes the camera into the capture.
 
-Not established from documentation or upstream source: whether the composite applies to one
-stream or to every stream an application runs. This is the single open technical risk in the
-plan, and the first capture task is a spike that measures it on the reference machine.
+Apple's WWDC23 session on ScreenCaptureKit (`wwdc2023/10136`) says ScreenCaptureKit applies the
+rendering "to the selected stream that your application is already running", that the system
+Video menu lists and controls each stream separately, and that each stream's delegate receives
+`stream(_:outputEffectDidStart:)` when the effect starts and stops. That favours the candidate
+design and gives a per-stream signal beside the frame attachment. It does not establish that a
+second stream of the same application stays clean through every transition. `SCVideoEffectOutput` is not an alternative: the macOS SDK marks
+`addVideoEffectOutput` unavailable on macOS.
 
-**Rationale**: Principle I requires the clean screen track and the separate camera track
-regardless. Writing the composite into the screen track, as QuickRecorder does, would bake the
-camera into the capture and is not permitted. A second stream is the only arrangement that can
-keep both.
+**Spike**: on the reference machine, run two named streams and check every frame of the clean
+stream, not a final screenshot, across: small, large, and off transitions; the creator selecting
+the other stream in the system controls; content-filter and source changes; pause and resume;
+camera switch and disconnect; and repeated activation. Confirm the independent camera recording
+stays usable while the system effect is on. The candidate design is adopted only if no clean
+frame ever carries the composite; otherwise the fallback is.
+
+**Rationale**: Principle I requires the clean screen track and the separate camera track. The
+constitution permits Presenter Overlay but does not require it, so the fallback is compliant, and
+FR-073 states the behaviour the creator sees in each case.
 
 ## R-010: Upstream baselines
 
@@ -216,35 +280,82 @@ commits, including timeline camera layouts with transitions and face framing, pe
 corners, editable zoom transitions, audio controls, and quick screenshot handoff — all within
 FR-013, FR-014, FR-018, FR-047, and FR-056 — plus the caption generator removed under R-002.
 
-**Rationale**: no local work has been built on the old copy, so rebasing now costs only the
-caption removal, while rebasing later would mean merging 25 commits into diverged code. The
-camera-layout work alone covers much of US4.
+**Rationale**: no local work has been built on the old copy, so rebasing is cheapest now. The
+diff from `4efbfeda` to `afa3176` touches 86 files in `apps/macos` (10,790 insertions, 565
+deletions); merging that into diverged code later would cost far more. The camera-layout work
+alone covers much of US4. The cost of rebasing is an estimate until the first build: it includes
+the caption removal, the module and test rename, the manifest, the Rust-service callers,
+resource-bundle lookup, and adapting the camera and editor models to segmented media. A
+bootstrap gate — the rebased tree builds and its carried tests pass — closes it.
 
-**Bundled wallpapers**: `Resources/Wallpapers` (58 MB) is restored, as FR-026 requires a supplied
-wallpaper. Its `CREDITS.md` records each image and video as sourced from Pexels under the Pexels
-License; the file is kept with the assets and recorded in `UPSTREAM.md`.
+The untracked copy is audited before it is replaced: its differences from `4efbfeda` (listed
+above) are the only local changes, and they are reapplied or dropped deliberately.
 
-## R-011: Frame rate and dropped-frame measurement
+**Bundled wallpapers**: `Resources/Wallpapers` (58 MB, images and videos) is restored. FR-026
+requires a supplied wallpaper, not this whole set; keeping it all is a choice. Its `CREDITS.md`
+records each asset as sourced from Pexels under the Pexels License. Asset licences are tracked
+separately from code licences in `UPSTREAM.md`: the application's AGPL-3.0 does not relicense
+the photographs and videos.
 
-**Decision**: Offer 30, 60, and 120 fps everywhere, and 240 only when the selected display
-reports `NSScreen.maximumFramesPerSecond >= 240`. Count a dropped frame as a frame
-ScreenCaptureKit delivered with status `complete` that the engine did not append to the screen
-writer input. Frames with status `idle` are not drops.
+## R-011: Frame rate, dropped frames, and resolution
+
+**Decision — offers**: frame-rate offers are per source. 30 and 60 are offered for every source.
+120 is offered where the source refreshes at 120 Hz or more, and 240 where it refreshes at
+240 Hz or more. For a display the refresh comes from `NSScreen.maximumFramesPerSecond`; a window
+or region uses the display it sits on and, if it spans displays, the lowest of them; an attached
+mobile device reports its own rate. A refresh at or above the rate is necessary, not sufficient:
+whether the mode, source, ScreenCaptureKit, and encoder sustain it is measured, and a rate that
+may not be sustained is offered with the FR-072 warning, never refused.
+
+**Decision — interval**: `minimumFrameInterval` is `CMTime(value: 1, timescale: fps)` for the
+chosen rate. `CMTime.zero` means the display's native refresh, as the SDK header documents, and
+is used only for a deliberate unthrottled measurement. QuickRecorder's expression for 60 fps and
+above, `CMTime(value: 1, timescale: 0)`, is an invalid time and is not carried over.
+
+**Decision — counting**: the engine keeps four counters per recording, and the recording's frame
+report shows all four:
+
+| Counter | Meaning |
+|---|---|
+| delivered | frames ScreenCaptureKit delivered with status `complete` |
+| append-rejected | delivered frames the writer input refused or the engine shed |
+| writer-failed | frames lost when a writer failed after accepting them |
+| written | frames present in the finalised file, counted by decoding it |
+
+Frames with status `idle` mean no content changed; they are not drops, and the previous frame's
+presentation duration extends to cover them, including the final hold and recordings with no
+change at all.
+
+App-side counters cannot see a frame ScreenCaptureKit never delivered. SC-002 is therefore
+measured end to end with a frame-ID fixture: a test animation draws a frame number on every
+display refresh. The baseline is the set of frame numbers the display actually showed, measured
+at the display, so a producer that itself misses a refresh is not blamed on the recorder. Loss
+is the share of shown frame numbers missing from the decoded file. Producer, delivered, written,
+and decoded measurements are kept distinct.
 
 **Evidence**: on the reference machine, `NSScreen.maximumFramesPerSecond` reports 120 for the
 built-in display and 60 for an attached Dell U3419W. ScreenCaptureKit delivers a new frame only
-when the screen content changes and marks unchanged intervals `idle`, so a display cannot yield
-more distinct frames than it refreshes. QuickRecorder passes `minimumFrameInterval = 0` (no
-throttling) for 60 fps and above.
+when content changes and marks unchanged intervals `idle`. Apple defines `idle` as no content
+change. The SDK header documents `kCMTimeZero` as the value for native refresh.
 
-**Rationale**: FR-074 forbids padding a recording with duplicates presented as real frames, so
-the offer is bounded by what the display delivers. Counting only `complete` frames that were
-not written makes SC-002 measurable without penalising a static screen.
+**Rationale**: FR-074 forbids duplicates presented as new frames, so offers are bounded by
+refresh. Counting only app-side loss would report 0% while ScreenCaptureKit silently delivered a
+quarter of a 120 Hz source; the fixture catches that. Byte-identical neighbouring frames prove
+neither padding nor loss, since unchanged content legitimately repeats, so they are not used as
+evidence.
 
-**Native resolution** in SC-002 and the performance budget means the display's backing-store
-pixel size in its current mode. The built-in display in its current scaled mode reports
-1312x848 points at 2x, a 2624x1696 backing store, below the panel's 3456x2234. Gate 3 records
-the mode used.
+**Resolution**: three sizes are kept apart, and Gate 3 records all three:
+
+| Size | Meaning | Reference built-in display |
+|---|---|---|
+| panel pixels | the physical panel | 3456x2234 |
+| source pixels | the backing store of the current display mode | 3456x2234 in the mode that looks like 1728x1117 |
+| stream output | the frame size ScreenCaptureKit delivers, read from each frame | must equal source pixels for SC-002 |
+
+The built-in display currently runs in a mode of 1312x848 points at 2x, a 2624x1696 backing
+store. SC-002 is not measured there: it names the full panel, so Gate 3 switches to the
+1728x1117 mode first. Captured frame dimensions and scale are read from the frames, not derived
+from `NSScreen` points times backing scale.
 
 ## R-012: Third-party dependencies
 
