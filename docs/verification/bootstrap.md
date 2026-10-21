@@ -78,8 +78,12 @@ registration handler. With the backend absent, registration failed and `AppModel
 `~/Library/Application Support/<storage folder>/Projects/`, so each full run left two recovery
 project documents there (holding the tests' fixture metadata) and two empty `.recovery` markers.
 Both tests now inject the registration failure explicitly, point every `AppPaths` field at a
-per-test temporary directory removed afterwards, and assert that the project they produce lies
-inside it.
+per-test temporary directory removed afterwards, and require the fallback to produce a project:
+they fail if no project path is returned, and assert that the project file and its `.recovery`
+marker exist inside that directory. Those source changes and assertions are the evidence of
+isolation for these two writers. As an observation of one run only, the real
+`Record Mac/Projects` folder held four files before and after a full `swift test`; an unchanged
+count does not rule out files replaced in place or writes elsewhere.
 
 **Permissions not yet exercised.** The launch check proves the bundle's identity and purpose
 strings, not camera, microphone, or screen recording grants. The ad-hoc signature's designated

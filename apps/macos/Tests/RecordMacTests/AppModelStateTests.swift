@@ -2783,10 +2783,16 @@ private func assertProjectPath(
     file: StaticString = #filePath,
     line: UInt = #line
 ) {
-    guard let projectPath else { return }
+    // Registration fails in these tests, so the durable fallback must have written the project.
+    guard let projectPath else {
+        XCTFail("No project path: the recovery fallback did not produce a project", file: file, line: line)
+        return
+    }
     let root = directory.resolvingSymlinksInPath().path + "/"
     let resolved = URL(fileURLWithPath: projectPath).resolvingSymlinksInPath().path
     XCTAssertTrue(resolved.hasPrefix(root), "Project written outside the test directory: \(projectPath)", file: file, line: line)
+    XCTAssertTrue(FileManager.default.fileExists(atPath: projectPath), "Project file missing: \(projectPath)", file: file, line: line)
+    XCTAssertTrue(FileManager.default.fileExists(atPath: "\(projectPath).recovery"), "Recovery marker missing: \(projectPath).recovery", file: file, line: line)
 }
 
 private func makeTemporaryDirectory() throws -> URL {
