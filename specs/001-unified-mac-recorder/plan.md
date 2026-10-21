@@ -174,6 +174,14 @@ cost of a flat namespace — two upstream file names collide (`ContentView.swift
 revision pinned in research.md R-010. `apps/landing` (marketing site) and `apps/rust-service` are
 not carried over; see research.md R-003.
 
+**Renderer ownership**: open-recorder's renderer is the sole preview, playback, and export path.
+Screenize's generators need part of Screenize's own model and render code to compile; that code
+is carried under `Generators/Support/` as dormant support for the generators and is never wired
+into preview, playback, or export. The carried set is settled by a bounded extraction that cuts
+the compatibility extension linking it to Screenize's preview engine (research.md R-004), and a
+release-gate scan keeps any code outside `Generators/` from reaching the carried render types.
+Wiring Screenize's renderer into the application would need this plan amended first.
+
 ## Complexity Tracking
 
 | Violation | Why Needed | Simpler Alternative Rejected Because |

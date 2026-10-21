@@ -112,13 +112,33 @@ a Rust toolchain to every build for one file.
 `KeystrokeTrackEmitterTests` is upstream coverage for keystroke-to-badge mapping, one of the
 tests the constitution requires.
 
-The generators are not self-contained. Following every type they and their tests reference
-reaches 49 further Screenize files: its timeline model (`Timeline/`), event and project models
-(`Models/`, `Project/`), much of its render engine (`Render/`), coordinate and accessibility
-helpers (`Core/`), and localisation and logging (`App/L10n.swift`, `App/Log.swift`,
-`App/AppLanguageManager.swift`). They import only Apple frameworks, and none makes a network call.
-Screenize's only Sparkle imports, `ScreenizeApp.swift` and `App/SparkleController.swift`, are
-outside that set. The list is an upper bound; the first build shows which files are unused.
+The generators are not self-contained. They and their tests need Screenize's timeline model
+(`Timeline/`), event and project models (`Models/`, `Project/`), its frame evaluator and spring
+and interpolation helpers (`Render/`), coordinate, colour, and accessibility helpers (`Core/`,
+`DesignSystem/`), and localisation and logging (`App/L10n.swift`, `App/L10n+Display.swift`,
+`App/Log.swift`, `App/AppLanguageManager.swift`). A scan that follows every referenced type and
+every extension of a needed type gives a provisional set of 37 files.
+
+Two links decide how much of Screenize comes with them:
+
+- `Render/MousePositionInterpolator.swift` ends with a "PreviewEngine Compatibility" extension
+  that only forwards to `MousePositionInterpolator.interpolate`. No generator calls it, but
+  carrying it pulls in `PreviewEngine` and through it `RenderCoordinator`, audio playback, the
+  frame readers, and `ScreenizeProject` — Screenize's whole preview stack. Cutting that one
+  extension keeps all of it out.
+- `SmartGeneration/Planning/ShotPlanner.swift` takes `[VideoFrameAnalyzer.FrameAnalysis]`, a value
+  type nested inside the actor that reads video. Moving the value type out lets the generators
+  stay free of video analysis without changing the algorithm.
+
+A reference scan cannot see method dependencies — for example `PreviewEngine.swift` calls
+`setupCallbacks()`, defined in `PreviewEngine+Setup.swift` — so the 37 files are an upper bound,
+not a proven build closure. A bounded extraction task settles the real set: it may add files the
+build reports missing, and removes a file only when the build and all 17 suites still pass
+without it. The set imports only Apple frameworks and makes no network call. Screenize's only
+Sparkle imports, `ScreenizeApp.swift` and `App/SparkleController.swift`, are outside it.
+
+The carried render types are dormant support for the generators. open-recorder remains the sole
+preview, playback, and export renderer (plan.md, Renderer ownership).
 
 **Rationale**: the constitution's quality gate requires automated tests for exactly this logic.
 Rewriting the generators would discard the tests that satisfy it.
