@@ -20,6 +20,10 @@ final class PrivacyUsageDescriptionTests: XCTestCase {
             plist["NSMicrophoneUsageDescription"] as? String,
             "Record Mac uses the microphone when you choose to include narration in a screen recording."
         )
+        XCTAssertEqual(
+            plist["NSScreenCaptureUsageDescription"] as? String,
+            "Record Mac captures your screen when you start a screen recording or take a screenshot."
+        )
     }
 
     func testInfoPlistDeclaresBundleIdentityAndVersion() throws {

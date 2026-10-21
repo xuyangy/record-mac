@@ -47,6 +47,8 @@
 	<true/>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Record Mac uses the microphone when you choose to include narration in a screen recording.</string>
+	<key>NSScreenCaptureUsageDescription</key>
+	<string>Record Mac captures your screen when you start a screen recording or take a screenshot.</string>
 	<key>NSSupportsAutomaticGraphicsSwitching</key>
 	<true/>
 	<key>UTExportedTypeDeclarations</key>

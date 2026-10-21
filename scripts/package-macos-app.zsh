@@ -12,9 +12,14 @@
 # A bare `swift run` process has no embedded Info.plist, so macOS cannot read the app's
 # identity or its purpose strings. This script builds the package and wraps the executable in
 # an app bundle with the given Info.plist, the icon, and every SwiftPM resource bundle the build
-# produced, then signs it. Every NS…UsageDescription key in the plist must be a non-empty
-# string, and NSCameraUsageDescription must be present; both are checked before signing and
-# again on the signed bundle.
+# produced, then signs it. Each product has a fixed list of purpose-string keys it must carry and
+# of resource bundles it needs (`required_purpose_keys` and `required_resource_bundles` below);
+# an unlisted product is refused. Every NS…UsageDescription key present must be a non-empty
+# string. Purpose strings are checked before signing and again on the signed bundle.
+#
+# Every product is signed with RecordMac.entitlements. Its audio-input entitlement is unused by
+# the camera-only PresenterOverlaySpike; an entitlement only permits a capability and is not a
+# permission grant, so it causes no microphone prompt.
 #
 # Signing uses $CODE_SIGN_IDENTITY when set, and an ad-hoc signature otherwise. An ad-hoc
 # signature's designated requirement is the build's cdhash, so camera, microphone, and screen
@@ -75,21 +80,39 @@ export DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Develope
 entitlements="$package_dir/Resources/RecordMac.entitlements"
 icon="$package_dir/Resources/AppIcon.icns"
 
+# What each product needs: the purpose strings for the devices it requests, and the resource
+# bundles it loads at runtime.
+typeset -A required_purpose_keys required_resource_bundles
+required_purpose_keys=(
+    RecordMac "NSCameraUsageDescription NSMicrophoneUsageDescription NSScreenCaptureUsageDescription"
+    PresenterOverlaySpike "NSCameraUsageDescription NSScreenCaptureUsageDescription"
+)
+required_resource_bundles=(
+    RecordMac "RecordMac_RecordMac.bundle KeyboardShortcuts_KeyboardShortcuts.bundle"
+    PresenterOverlaySpike ""
+)
+(( ${+required_purpose_keys[$product]} )) || {
+    print -u2 -- "Unknown product $product: add its required purpose keys and resource bundles to this script"
+    exit 2
+}
+
 # Prints the string value at a key, failing if the key is missing or not a string.
 plist_string() {
     plutil -extract "$2" raw -expect string "$1"
 }
 
-# Fails unless every purpose-string key in the plist is a non-empty string, and the camera key
-# is present.
+# Fails unless every purpose-string key the product requires is present, and every purpose-string
+# key in the plist is a non-empty string.
 check_purpose_strings() {
     local plist="$1" key value
     local keys=(${(f)"$(plutil -convert json -o - "$plist" | python3 -I -c \
         'import json, sys; print("\n".join(k for k in json.load(sys.stdin) if k.endswith("UsageDescription")))')"})
-    (( ${keys[(Ie)NSCameraUsageDescription]} )) || {
-        print -u2 -- "$plist lacks NSCameraUsageDescription"
-        return 1
-    }
+    for key in ${=required_purpose_keys[$product]}; do
+        (( ${keys[(Ie)$key]} )) || {
+            print -u2 -- "$plist lacks $key, which $product requires"
+            return 1
+        }
+    done
     for key in "${keys[@]}"; do
         value="$(plist_string "$plist" "$key")" || {
             print -u2 -- "$plist: $key is not a string"
@@ -116,7 +139,12 @@ binary="$bin_path/$product"
 [[ -x "$binary" ]] || { print -u2 -- "Missing $configuration executable: $binary"; exit 1; }
 
 resource_bundles=("$bin_path"/*.bundle(N))
-(( ${#resource_bundles} > 0 )) || { print -u2 -- "No resource bundles found in $bin_path"; exit 1; }
+for required_bundle in ${=required_resource_bundles[$product]}; do
+    [[ -d "$bin_path/$required_bundle" ]] || {
+        print -u2 -- "Missing resource bundle $required_bundle, which $product requires, in $bin_path"
+        exit 1
+    }
+done
 
 bundle_dir="$package_dir/.build/app/$configuration/$product.app"
 contents_dir="$bundle_dir/Contents"
