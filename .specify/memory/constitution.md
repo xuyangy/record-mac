@@ -59,15 +59,15 @@ the required behavior; the incapability MUST be documented in the feature plan w
 API and the failure observed. FFmpeg or equivalent MAY be used for offline export and
 format conversion outside the live capture path.
 
-Where a native API is available on only some supported hardware, the application MUST
-detect the capability at runtime and degrade to its own implementation. It MUST NOT refuse
-to launch, disable the surrounding feature, or fail silently, and the reduced capability
-MUST be visible to the user rather than inferred from missing output.
+Where a native API is available on only some supported Macs or macOS versions, the
+application MUST detect the capability at runtime and degrade to its own implementation. It
+MUST NOT refuse to launch, disable the surrounding feature, or fail silently, and the reduced
+capability MUST be visible to the user rather than inferred from missing output.
 
 Rationale: the native stack is the only place sustained high-resolution capture, split
-system audio, and hardware encode exist, and every non-native shim costs frames on the
-reference Mac. But a capability that exists on one supported Mac and not another is a
-rendering detail, not a reason to fork the product.
+system audio, and hardware encode exist, and every non-native shim costs frames. But a
+capability that exists on one supported Mac or macOS version and not another is a rendering
+detail, not a reason to fork the product.
 
 ### IV. Local-Only By Construction (NON-NEGOTIABLE)
 
@@ -131,25 +131,23 @@ project. Reconstructing provenance later, from memory, is not possible.
 
 ## Platform and Technology Constraints
 
-- **Target platform**: macOS 14 (Sonoma) or later, on Intel Macs with a T2 Security Chip
-  (2018 or later) or on Apple Silicon. Both are first-class targets. Neither may be treated
-  as a degraded tier except for the explicitly hardware-gated capabilities listed below.
-- **Reference hardware**: MacBook Pro 15-inch 2018 — Intel Core i7-8850H, Radeon Pro 560X,
-  2880x1800 internal display, macOS 14. Performance budgets are measured here, and a change
-  that meets its budget only on faster hardware has not met it.
-- **Hardware-gated capabilities**: Presenter Overlay requires Apple Silicon, because it
-  depends on the Neural Engine for subject cutout. It MAY be used for live camera
-  compositing where available, but the application's own render-stage camera compositing
-  (already required by Principle II) MUST provide the same finished output on every
-  supported host. No other feature in this constitution may be gated on Apple Silicon
-  without an amendment recording the API and the hardware reason.
+- **Target platform**: macOS 15 (Sequoia) or later, on Apple Silicon only. Intel Macs are
+  not supported, and no code path, build setting, or test exists to serve them.
+- **Reference hardware**: MacBook Pro (Mac17,8) — Apple M5 Pro, 18-core CPU, 20-core GPU,
+  48 GB memory, 3456x2234 built-in display, macOS 27. Performance budgets are measured here.
+  Because it is the fastest supported Mac, a budget met here is a necessary condition, not
+  proof that slower Apple Silicon meets it.
+- **Presenter Overlay**: MAY be used. The system-composited overlay output MUST NOT replace
+  the clean screen track or the separate camera track that Principle I requires; it MAY be
+  used for the live preview or stored as an additional derived track. The application's own
+  render-stage camera compositing (Principle II) remains the source of the finished output.
 - **Single-user scope**: this is a personal tool. Multi-user accounts, licensing systems,
   server components, and cloud rendering are out of scope and MUST NOT be added.
 - **Export**: MP4 and MOV containers, H.264 and HEVC video, with selectable quality
   presets. Export resolution MUST support at least the capture resolution of any attached
   display, up to 4K.
-- **HEVC with alpha**: verified available and hardware accelerated on the reference hardware.
-  Features MAY depend on it. Verification of alpha output MUST use the platform decoder, as
+- **HEVC with alpha**: hardware accelerated on Apple Silicon. Features MAY depend on it.
+  Verification of alpha output MUST use the platform decoder, as
   some third-party decoders ignore the auxiliary alpha layer and report a correct file as
   opaque.
 - **Audio**: microphone and system audio MUST be independently selectable, independently
@@ -173,9 +171,10 @@ project. Reconstructing provenance later, from memory, is not possible.
 - **Manual verification on real hardware** is required for anything that touches capture
   devices, permissions, or encode. The verification MUST be recorded in the change: what was
   recorded, at what settings, on which host, and what was checked.
-- **Hardware-gated code paths** MUST be verified on the reference hardware specifically,
-  including the fallback path. A capability-detection branch that has only been exercised on
-  the host that has the capability is untested.
+- **Capability-gated code paths** MUST be verified on the reference hardware, including the
+  fallback path. Where the reference hardware has the capability, the fallback is exercised by
+  forcing detection to report it absent. A capability-detection branch whose fallback has
+  never run is untested.
 - **Regression corpus**: a small set of stored captures with telemetry MUST be maintained,
   and render changes MUST be checked against it before merge.
 - Every change MUST state which principles it engages, and any deviation MUST be justified
@@ -204,4 +203,4 @@ and after design. Violations are either fixed or recorded as explicitly justifie
 exceptions with the simpler alternative that was rejected and why. An unjustified violation
 blocks the change.
 
-**Version**: 1.3.0 | **Ratified**: 2026-09-11 | **Last Amended**: 2026-09-11
+**Version**: 2.0.0 | **Ratified**: 2026-09-11 | **Last Amended**: 2026-10-21
