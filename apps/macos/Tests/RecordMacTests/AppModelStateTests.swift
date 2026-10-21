@@ -1553,17 +1553,23 @@ final class AppModelStateTests: XCTestCase {
     func testRecordingCompletionEmitsEditorCommandThroughNativeHandlerWhenCaptureWindowsAreHidden() async throws {
         var handledCommands: [NativeWindowCommand] = []
         var model: AppModel!
+        let directory = try makeTemporaryDirectory()
         let outputURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("finished-recording-\(UUID().uuidString).mp4")
         defer {
             try? FileManager.default.removeItem(at: outputURL)
+            try? FileManager.default.removeItem(at: directory)
         }
         try Data("mp4".utf8).write(to: outputURL)
         model = AppModel(
             stopRecording: {
                 outputURL
-            }
+            },
+            // The backend is absent, so registration fails and the recovery project is written
+            // under model.paths, never into the user's Application Support folder.
+            registerCapturedMedia: { _, _ in throw AppModelTestError.backendUnavailable }
         )
+        model.paths = makeTemporaryAppPaths(in: directory)
         model.installNativeWindowCommandHandler { command in
             handledCommands.append(command)
             _ = model.consumeWindowCommand(command)
@@ -1580,6 +1586,7 @@ final class AppModelStateTests: XCTestCase {
         let editorCommand = try XCTUnwrap(handledCommands.last { $0.action == .showStudio })
         XCTAssertEqual(editorCommand.editorSession?.kind, .video)
         XCTAssertEqual(editorCommand.editorSession?.url, outputURL)
+        assertProjectPath(editorCommand.editorSession?.projectPath, isInside: directory)
         XCTAssertEqual(model.hudState.phase, .setup(.recording))
         XCTAssertEqual(model.hudState.selectedSource, source)
         XCTAssertEqual(model.hudState.presentation, .hidden)
@@ -1588,6 +1595,7 @@ final class AppModelStateTests: XCTestCase {
     }
 
     func testRecordingStartWaitsForFacecamBeforeScreenCapture() async throws {
+        let directory = try makeTemporaryDirectory()
         let outputURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("facecam-ordered-recording-\(UUID().uuidString).mp4")
         let facecamURL = outputURL
@@ -1596,6 +1604,7 @@ final class AppModelStateTests: XCTestCase {
         defer {
             try? FileManager.default.removeItem(at: outputURL)
             try? FileManager.default.removeItem(at: facecamURL)
+            try? FileManager.default.removeItem(at: directory)
         }
 
         let facecamStartedAt = Date(timeIntervalSince1970: 10)
@@ -1635,8 +1644,12 @@ final class AppModelStateTests: XCTestCase {
             stopFacecamRecording: {
                 facecamURL
             },
-            runRecordingCountdown: { _ in }
+            runRecordingCountdown: { _ in },
+            // The backend is absent, so registration fails and the recovery project is written
+            // under model.paths, never into the user's Application Support folder.
+            registerCapturedMedia: { _, _ in throw AppModelTestError.backendUnavailable }
         )
+        model.paths = makeTemporaryAppPaths(in: directory)
         let source = makeSource()
         model.includeCamera = true
         model.showCursor = false
@@ -1663,6 +1676,7 @@ final class AppModelStateTests: XCTestCase {
         }
 
         let editorSession = try XCTUnwrap(model.windowCommand?.editorSession)
+        assertProjectPath(editorSession.projectPath, isInside: directory)
         XCTAssertEqual(editorSession.recordingSession?.facecamVideoPath, facecamURL.path)
         XCTAssertEqual(editorSession.recordingSession?.facecamOffsetMs, -500)
         let videoState = try XCTUnwrap(editorSession.videoEditorState)
@@ -2752,6 +2766,27 @@ private func waitForBackendCallCount(_ expectedCount: Int, gate: BackendSnapshot
     }
     let actualCount = await gate.callCount
     XCTAssertGreaterThanOrEqual(actualCount, expectedCount)
+}
+
+private func makeTemporaryAppPaths(in directory: URL) -> AppPaths {
+    AppPaths(
+        recordingsDir: directory.path,
+        screenshotsDir: directory.path,
+        projectsDir: directory.path,
+        supportDir: directory.path
+    )
+}
+
+private func assertProjectPath(
+    _ projectPath: String?,
+    isInside directory: URL,
+    file: StaticString = #filePath,
+    line: UInt = #line
+) {
+    guard let projectPath else { return }
+    let root = directory.resolvingSymlinksInPath().path + "/"
+    let resolved = URL(fileURLWithPath: projectPath).resolvingSymlinksInPath().path
+    XCTAssertTrue(resolved.hasPrefix(root), "Project written outside the test directory: \(projectPath)", file: file, line: line)
 }
 
 private func makeTemporaryDirectory() throws -> URL {

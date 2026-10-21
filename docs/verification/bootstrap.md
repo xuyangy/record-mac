@@ -71,11 +71,26 @@ this check.
 **Linkage.** `otool -L` shows no SwiftLAME or LAME library; `nm` shows `_lame_init` and the other
 `_lame_*` symbols defined in the executable: both are linked statically (see `UPSTREAM.md`).
 
-**Test side effect.** Some carried tests write recovery projects into the real
-`~/Library/Application Support/<storage folder>/Projects/` rather than a temporary directory.
-Each full run here added four empty `recovered-*.openrecorder` files there. This is upstream test
-behaviour, not caused by the rebase; it is a test-isolation defect to fix alongside the project
-format work.
+**Test isolation.** Two carried tests in `AppModelStateTests.swift` —
+`testRecordingCompletionEmitsEditorCommandThroughNativeHandlerWhenCaptureWindowsAreHidden` and
+`testRecordingStartWaitsForFacecamBeforeScreenCapture` — set neither `model.paths` nor a capture
+registration handler. With the backend absent, registration failed and `AppModel` fell back to
+`~/Library/Application Support/<storage folder>/Projects/`, so each full run left two recovery
+project documents there (holding the tests' fixture metadata) and two empty `.recovery` markers.
+Both tests now inject the registration failure explicitly, point every `AppPaths` field at a
+per-test temporary directory removed afterwards, and assert that the project they produce lies
+inside it.
+
+**Permissions not yet exercised.** The launch check proves the bundle's identity and purpose
+strings, not camera, microphone, or screen recording grants. The ad-hoc signature's designated
+requirement is the build's cdhash (`codesign -d -r-` prints
+`designated => cdhash H"…"`), so any grant is tied to that exact build: after a rebuild that
+changes the code, macOS may prompt again or keep a stale grant that needs resetting. Hardened
+runtime does not give a stable identity. The real permission behaviour — first prompt, denial,
+grant, relaunch, and a changed rebuild, with the signing identity and its designated requirement
+recorded — is verified on this machine in T014 (camera and screen recording, during the
+Presenter Overlay spike) and T055 (every permission). An Apple Development identity passed as
+`CODE_SIGN_IDENTITY` is the recommended stable signing route for those checks.
 
 ## Outcome
 

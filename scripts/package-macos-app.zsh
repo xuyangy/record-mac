@@ -9,8 +9,11 @@
 # SwiftPM resource bundle the build produced, then signs it.
 #
 # Signing uses $CODE_SIGN_IDENTITY when set, and an ad-hoc signature otherwise. An ad-hoc
-# signature changes with every build, so macOS may ask again for permissions after a rebuild;
-# a stable local identity in CODE_SIGN_IDENTITY keeps the grants.
+# signature's designated requirement is the build's cdhash, so camera, microphone, and screen
+# recording grants are tied to that exact build: after a rebuild that changes the code, macOS may
+# ask again, or keep a stale grant that needs resetting (`make reset-macos-permissions`). For
+# permission testing, set CODE_SIGN_IDENTITY to an Apple Development identity, and check its
+# designated requirement with `codesign -d -r-`.
 #
 # Adapted from open-recorder's scripts/package-macos-app-shared.zsh (Apache-2.0); see
 # UPSTREAM.md.
@@ -67,9 +70,9 @@ contents_dir="$bundle_dir/Contents"
 rm -rf "$bundle_dir"
 mkdir -p "$contents_dir/MacOS" "$contents_dir/Resources"
 
-cp "$binary" "$contents_dir/MacOS/$executable_name"
-cp "$info_plist" "$contents_dir/Info.plist"
-cp "$icon" "$contents_dir/Resources/AppIcon.icns"
+/bin/cp "$binary" "$contents_dir/MacOS/$executable_name"
+/bin/cp "$info_plist" "$contents_dir/Info.plist"
+/bin/cp "$icon" "$contents_dir/Resources/AppIcon.icns"
 for resource_bundle in "${resource_bundles[@]}"; do
     ditto "$resource_bundle" "$contents_dir/Resources/${resource_bundle:t}"
 done
@@ -89,8 +92,12 @@ packaged_identifier="$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$
     exit 1
 }
 for key in NSCameraUsageDescription NSMicrophoneUsageDescription; do
-    /usr/libexec/PlistBuddy -c "Print :$key" "$contents_dir/Info.plist" >/dev/null 2>&1 || {
+    purpose="$(/usr/libexec/PlistBuddy -c "Print :$key" "$contents_dir/Info.plist" 2>/dev/null)" || {
         print -u2 -- "Packaged Info.plist lacks $key"
+        exit 1
+    }
+    [[ -n "${purpose//[[:space:]]/}" ]] || {
+        print -u2 -- "Packaged Info.plist has an empty $key"
         exit 1
     }
 done
