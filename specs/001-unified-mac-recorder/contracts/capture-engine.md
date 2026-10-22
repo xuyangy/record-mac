@@ -94,7 +94,7 @@ source has already disappeared.
     the overlay stream, the clean stream still writes the `screen` track and the camera still
     writes the `camera` track; composited frames go only to the live preview and, when
     requested, `presenterComposite` segments. If the clean stream's frames carry an engaged
-    `presenterOverlayContentRect`, or its delegate reports `outputEffectDidStart`, the engine
+    `presenterOverlayContentRect`, or its delegate reports `outputVideoEffectDidStart(for:)`, the engine
     keeps writing every frame, records the time range in the project's `overlaidRanges`, and
     tells the creator. Where the spike in research.md R-009 shows the clean stream cannot be kept
     clean, the engine runs one stream, reports Presenter Overlay as reduced before recording, and

@@ -37,6 +37,12 @@ let package = Package(
             ],
             swiftSettings: strictConcurrency
         ),
+        // Gate C's Presenter Overlay measurement, packaged as its own signed app
+        // (research.md R-009). Resource-free, and never linked into RecordMac.
+        .executableTarget(
+            name: "PresenterOverlaySpike",
+            swiftSettings: strictConcurrency
+        ),
         .testTarget(
             name: "RecordMacTests",
             dependencies: ["RecordMac"],

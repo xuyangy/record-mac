@@ -286,7 +286,8 @@ bakes the camera into the capture.
 Apple's WWDC23 session on ScreenCaptureKit (`wwdc2023/10136`) says ScreenCaptureKit applies the
 rendering "to the selected stream that your application is already running", that the system
 Video menu lists and controls each stream separately, and that each stream's delegate receives
-`stream(_:outputEffectDidStart:)` when the effect starts and stops. That favours the candidate
+`outputVideoEffectDidStart(for:)` when the effect starts and `outputVideoEffectDidStop(for:)`
+when it stops. That favours the candidate
 design and gives a per-stream signal beside the frame attachment. It does not establish that a
 second stream of the same application stays clean through every transition. `SCVideoEffectOutput` is not an alternative: the macOS SDK marks
 `addVideoEffectOutput` unavailable on macOS.
