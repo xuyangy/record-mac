@@ -56,18 +56,33 @@ What the spike does when run:
 - Requests camera access, then reads shareable content, which triggers the screen recording
   prompt. Permission state is logged before and after, for T014's permission record.
 - Records the default camera through `AVCaptureSession` to `camera-N.mov`, with a live camera
-  preview in its window. Choosing another camera from the window starts a new file. Device
-  connect, disconnect, and session runtime errors are logged.
+  preview in its window. The preview joins the session before the session runs and before the
+  movie file starts; when it joined after, the file stopped one millisecond after starting on
+  every launch, and the preview's reconfiguration of the running session is the suspected cause.
+  Choosing another camera from the window starts a new file. A file that finishes with an error,
+  without `AVErrorRecordingSuccessfullyFinishedKey`, and without a switch or stop asking for it,
+  is logged with its error domain and code and followed by a new file while the session runs, at
+  most three times; while paused, that new file waits for resume. Device connect, disconnect,
+  and session runtime errors are logged.
 - Starts two `SCStream`s named `clean` and `overlay` (`SCStreamConfiguration.streamName`) over
-  the same display filter, at the display's backing pixel size, 60 fps, BGRA, cursor shown.
+  the same display filter, at the display's backing pixel size, 60 fps, BGRA, cursor shown. The
+  built-in display is captured first, or the first listed display when none is built in; the
+  chosen display is kept by its ID.
 - Logs every `complete` frame of each stream to `frames.jsonl` with stream name, generation,
-  presentation timestamp, `presenterOverlayContentRect` (or null), content rect, and pixel
-  size. Saves one PNG per second of each stream under `clean/` and `overlay/`.
+  presentation timestamp, content rect, pixel size, `presenterOverlayContentRect`, and
+  `presenterOverlayEngaged`. The rect is `null` when the attachment is absent, `"null-rect"`
+  for `CGRect.null`, `"unparsed: …"` for a value that is not a rect, and
+  `[x, y, width, height]` otherwise; engaged means a finite, non-empty rect. Non-finite numbers
+  are written as text, since `JSONSerialization` raises an exception on them, and a frame with a
+  non-finite timestamp saves no PNG. Saves one PNG per second of each stream under `clean/` and
+  `overlay/`.
 - Window controls cover the T014 cases: Pause and Resume (stops both streams and pauses the
   camera file, then starts new streams as the next generation), Toggle Filter (excludes or
   includes the spike's own windows), Next Display (changes the source), and the camera picker.
-- On quit, writes `summary.json` with each stream's complete-frame count, the count carrying a
-  Presenter Overlay rect, other frame statuses, and effect start and stop counts.
+- On quit, writes `summary.json` with each stream's complete-frame count, the count with an
+  engaged Presenter Overlay rect, other frame statuses, and effect start and stop counts. Zero
+  engaged frames alone does not show a stream stayed clean: T014 also reviews the per-frame
+  attachment values, including any `"unparsed: …"` ones, and the saved PNGs.
 
 Output goes to `~/Movies/PresenterOverlaySpike/<timestamp>/`, or to the directory after
 `--output`.

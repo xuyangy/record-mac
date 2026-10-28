@@ -92,7 +92,7 @@ final class StreamProbe: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked 
 
     struct FrameCounts {
         var complete = 0
-        var completeWithOverlayRect = 0
+        var completeWithEngagedOverlayRect = 0
         var otherStatus: [String: Int] = [:]
         var effectStarts = 0
         var effectStops = 0
@@ -131,24 +131,30 @@ final class StreamProbe: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked 
         }
 
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-        let overlayRect = Self.rect(attachments[.presenterOverlayContentRect])
+        let overlayValue = attachments[.presenterOverlayContentRect]
+        let overlayRect = Self.rect(overlayValue)
         let contentRect = Self.rect(attachments[.contentRect])
 
         lock.lock()
         counts.complete += 1
-        if overlayRect != nil { counts.completeWithOverlayRect += 1 }
-        let second = Int(pts.seconds.rounded(.down))
-        let saveThisFrame = second != lastSavedSecond
-        if saveThisFrame { lastSavedSecond = second }
+        if let overlayRect, Self.isEngaged(overlayRect) { counts.completeWithEngagedOverlayRect += 1 }
+        // A non-finite timestamp is still logged, but saves no PNG.
+        var saveThisFrame = false
+        if pts.seconds.isFinite {
+            let second = Int(pts.seconds.rounded(.down))
+            saveThisFrame = second != lastSavedSecond
+            if saveThisFrame { lastSavedSecond = second }
+        }
         lock.unlock()
 
         var record: [String: Any] = [
             "stream": name,
             "generation": generation,
-            "pts": pts.seconds,
+            "pts": Self.number(pts.seconds),
             "ptsValue": pts.value,
             "ptsTimescale": pts.timescale,
-            "presenterOverlayContentRect": overlayRect.map(Self.array) ?? NSNull(),
+            "presenterOverlayContentRect": Self.describe(overlayValue: overlayValue, rect: overlayRect),
+            "presenterOverlayEngaged": overlayRect.map(Self.isEngaged) ?? false,
         ]
         if let contentRect { record["contentRect"] = Self.array(contentRect) }
         if let pixelBuffer = sampleBuffer.imageBuffer {
@@ -201,8 +207,30 @@ final class StreamProbe: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked 
         return CGRect(dictionaryRepresentation: value as! CFDictionary)
     }
 
-    private static func array(_ rect: CGRect) -> [Double] {
-        [rect.origin.x, rect.origin.y, rect.size.width, rect.size.height]
+    /// A rect counts as the overlay being engaged only when it is a finite, non-empty area.
+    /// CGRect.null, whose origin is infinite, does not count; which value the system attaches
+    /// while the overlay is off is for T014 to observe.
+    private static func isEngaged(_ rect: CGRect) -> Bool {
+        !rect.isNull && !rect.isInfinite && !rect.isEmpty
+            && [rect.origin.x, rect.origin.y, rect.width, rect.height].allSatisfy(\.isFinite)
+    }
+
+    /// The attachment as logged: null when absent, "null-rect" for CGRect.null, the raw value as
+    /// text when it is not a rect, and [x, y, width, height] otherwise.
+    private static func describe(overlayValue: Any?, rect: CGRect?) -> Any {
+        guard let overlayValue else { return NSNull() }
+        guard let rect else { return "unparsed: \(overlayValue)" }
+        return rect.isNull ? "null-rect" : array(rect)
+    }
+
+    /// JSONSerialization throws an Objective-C exception on NaN and infinity, so those are
+    /// written as text.
+    private static func number(_ value: Double) -> Any {
+        value.isFinite ? value : String(describing: value)
+    }
+
+    private static func array(_ rect: CGRect) -> [Any] {
+        [rect.origin.x, rect.origin.y, rect.size.width, rect.size.height].map { number(Double($0)) }
     }
 
     static func describe(_ status: SCFrameStatus) -> String {
@@ -235,6 +263,13 @@ final class CameraRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
     private var input: AVCaptureDeviceInput?
     private var fileIndex = 0
     private var observers: [NSObjectProtocol] = []
+    /// Files stopped on purpose by a switch or stop, whose finish needs no restart.
+    private var intentionalStops = Set<URL>()
+    private var restartsAfterFailure = 0
+    private var isPaused = false
+    /// A replacement file that was due while paused.
+    private var restartPendingResume = false
+    private static let maximumRestartsAfterFailure = 3
 
     init(log: SpikeLog) {
         self.log = log
@@ -290,7 +325,7 @@ final class CameraRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
 
     func switchTo(_ device: AVCaptureDevice) {
         guard device.uniqueID != input?.device.uniqueID else { return }
-        if output.isRecording { output.stopRecording() }
+        stopRecordingIntentionally()
         session.beginConfiguration()
         if let input { session.removeInput(input) }
         do {
@@ -307,25 +342,69 @@ final class CameraRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
         startNewFile()
     }
 
+    /// Pause is kept here, not read back from the movie output, because a file may be between a
+    /// failure and its replacement when Pause is pressed.
     func pause() {
+        isPaused = true
         if output.isRecording { output.pauseRecording() }
         log.event("camera recording paused")
     }
 
     func resume() {
-        if output.isRecordingPaused { output.resumeRecording() }
+        isPaused = false
+        if output.isRecordingPaused {
+            output.resumeRecording()
+        } else if restartPendingResume, session.isRunning, !output.isRecording {
+            log.event("starting the camera file deferred while paused")
+            startNewFile()
+        }
+        restartPendingResume = false
         log.event("camera recording resumed")
     }
 
     func stop() {
-        if output.isRecording { output.stopRecording() }
+        stopRecordingIntentionally()
         session.stopRunning()
+    }
+
+    private func stopRecordingIntentionally() {
+        guard output.isRecording else { return }
+        if let url = output.outputFileURL { intentionalStops.insert(url) }
+        output.stopRecording()
     }
 
     private func startNewFile() {
         fileIndex += 1
         let url = log.directory.appendingPathComponent("camera-\(fileIndex).mov")
         output.startRecording(to: url, recordingDelegate: self)
+    }
+
+    /// A file that finished with an error, without the successfully-finished flag, and without a
+    /// switch or stop asking for it, is followed by a new file while the session runs, at most
+    /// three times. While paused, the new file waits for resume.
+    private func handleFinish(of url: URL, failed: Bool) {
+        guard intentionalStops.remove(url) == nil, failed, session.isRunning else { return }
+        guard restartsAfterFailure < Self.maximumRestartsAfterFailure else {
+            log.event("camera file stopped again; no further restart")
+            return
+        }
+        restartsAfterFailure += 1
+        guard !isPaused else {
+            restartPendingResume = true
+            log.event("camera file stopped unexpectedly while paused; a new file starts on resume (restart \(restartsAfterFailure))")
+            return
+        }
+        log.event("camera file stopped unexpectedly; starting a new file (restart \(restartsAfterFailure))")
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(500))
+            guard self.session.isRunning, !self.output.isRecording else { return }
+            guard !self.isPaused else {
+                self.restartPendingResume = true
+                self.log.event("paused during the restart delay; a new file starts on resume")
+                return
+            }
+            self.startNewFile()
+        }
     }
 
     nonisolated func fileOutput(
@@ -339,11 +418,17 @@ final class CameraRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
         _ output: AVCaptureFileOutput, didFinishRecordingTo outputFileURL: URL,
         from connections: [AVCaptureConnection], error: Error?
     ) {
+        var failed = false
         if let error {
-            log.event("camera file finished: \(outputFileURL.lastPathComponent) with error: \(error.localizedDescription)")
+            let nsError = error as NSError
+            // A finish can carry an error yet still have written a usable file.
+            let finished = nsError.userInfo[AVErrorRecordingSuccessfullyFinishedKey] as? Bool ?? false
+            failed = !finished
+            log.event("camera file finished: \(outputFileURL.lastPathComponent) with error \(nsError.domain) \(nsError.code), successfullyFinished=\(finished): \(error.localizedDescription)")
         } else {
             log.event("camera file finished: \(outputFileURL.lastPathComponent)")
         }
+        Task { @MainActor in self.handleFinish(of: outputFileURL, failed: failed) }
     }
 }
 
@@ -359,7 +444,8 @@ final class SpikeController: NSObject, NSApplicationDelegate {
     private let log: SpikeLog
     private var camera: CameraRecorder!
     private var displays: [SCDisplay] = []
-    private var displayIndex = 0
+    /// The captured display, kept by ID because the shareable-content order can change.
+    private var selectedDisplayID: CGDirectDisplayID?
     private var excludeOwnWindows = true
     private var generation = 0
     private var streams: [(stream: SCStream, probe: StreamProbe)] = []
@@ -418,8 +504,11 @@ final class SpikeController: NSObject, NSApplicationDelegate {
 
         if cameraGranted, let device = AVCaptureDevice.default(for: .video) {
             do {
-                try camera.start(with: device)
+                // The preview joins the session before it runs and before the movie file starts.
+                // A movie file started before the preview was attached stopped at once; the
+                // preview's reconfiguration of the running session is the suspected cause.
                 attachPreview()
+                try camera.start(with: device)
             } catch {
                 log.event("camera start failed: \(error.localizedDescription)")
             }
@@ -450,8 +539,13 @@ final class SpikeController: NSObject, NSApplicationDelegate {
 
     // MARK: Streams
 
+    /// Only called while `displays` is non-empty.
+    private var currentDisplay: SCDisplay {
+        displays.first { $0.displayID == selectedDisplayID } ?? displays[0]
+    }
+
     private func currentFilter() -> SCContentFilter {
-        let display = displays[displayIndex]
+        let display = currentDisplay
         let excluded = excludeOwnWindows ? ownApplications : []
         return SCContentFilter(display: display, excludingApplications: excluded, exceptingWindows: [])
     }
@@ -466,7 +560,10 @@ final class SpikeController: NSObject, NSApplicationDelegate {
             displays = content.displays
             let pid = ProcessInfo.processInfo.processIdentifier
             ownApplications = content.applications.filter { $0.processID == pid }
-            if displayIndex >= displays.count { displayIndex = 0 }
+            if !displays.contains(where: { $0.displayID == selectedDisplayID }) {
+                // Start on the built-in display, the reference display for SC-002.
+                selectedDisplayID = (displays.first { CGDisplayIsBuiltin($0.displayID) != 0 } ?? displays.first)?.displayID
+            }
         } catch {
             log.event("shareable content refresh failed: \(error.localizedDescription)")
         }
@@ -493,7 +590,7 @@ final class SpikeController: NSObject, NSApplicationDelegate {
         await refreshContent()
         guard !displays.isEmpty else { return }
         generation += 1
-        let display = displays[displayIndex]
+        let display = currentDisplay
         let filter = currentFilter()
         var started: [(SCStream, StreamProbe)] = []
         for name in ["clean", "overlay"] {
@@ -532,7 +629,7 @@ final class SpikeController: NSObject, NSApplicationDelegate {
         await refreshContent()
         guard !displays.isEmpty else { return }
         let filter = currentFilter()
-        let display = displays[displayIndex]
+        let display = currentDisplay
         for entry in streams {
             do {
                 try await entry.stream.updateContentFilter(filter)
@@ -577,7 +674,8 @@ final class SpikeController: NSObject, NSApplicationDelegate {
             log.event("only one display; source unchanged")
             return
         }
-        displayIndex = (displayIndex + 1) % displays.count
+        let index = displays.firstIndex { $0.displayID == selectedDisplayID } ?? 0
+        selectedDisplayID = displays[(index + 1) % displays.count].displayID
         Task { await applyFilter() }
     }
 
@@ -612,7 +710,7 @@ final class SpikeController: NSObject, NSApplicationDelegate {
                 "stream": probe.name,
                 "generation": probe.generation,
                 "complete": counts.complete,
-                "completeWithPresenterOverlayContentRect": counts.completeWithOverlayRect,
+                "completeWithEngagedPresenterOverlayRect": counts.completeWithEngagedOverlayRect,
                 "otherStatus": counts.otherStatus,
                 "effectStarts": counts.effectStarts,
                 "effectStops": counts.effectStops,
@@ -708,7 +806,7 @@ final class SpikeController: NSObject, NSApplicationDelegate {
     }
 
     private func updateStatus() {
-        let display = displays.indices.contains(displayIndex) ? displays[displayIndex].displayID : 0
+        let display = selectedDisplayID ?? 0
         setStatus(
             "\(paused ? "Paused" : "Capturing") · generation \(generation) · display \(display) · own windows \(excludeOwnWindows ? "excluded" : "included") · output \(log.directory.path)\nTurn Presenter Overlay on from the Video menu in the menu bar, and choose the \"overlay\" stream."
         )
