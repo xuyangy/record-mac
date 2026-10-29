@@ -61,7 +61,7 @@ Checked against constitution 2.0.0.
 
 | Principle | Gate | Status |
 |---|---|---|
-| I. Capture Fidelity | Capture written as captured; effects render-time only; mic/system audio never merged at capture; preview degrades before capture drops | **PASS by design for the screen track; camera continuity under Presenter Overlay open.** Separate `AVAssetWriterInput`s for screen, mic, and system audio; screen and camera segmented at native format. Presenter Overlay takes the fallback closed by Gate C; the camera loss while the effect is on is open (R-009). |
+| I. Capture Fidelity | Capture written as captured; effects render-time only; mic/system audio never merged at capture; preview degrades before capture drops | **PASS by design for the screen track; camera continuity under Presenter Overlay open.** Separate `AVAssetWriterInput`s for screen, mic, and system audio; screen and camera segmented at native format. Presenter Overlay takes the fallback closed by Gate C. The camera is captured through a data output into an `AVAssetWriter`; a gap of about 0.57 s at the first effect start and the writer path's validation are open (R-009, T148). |
 | II. Stage Separation | Capture, Telemetry, Render separated by serializable contracts | **PASS by design.** Screenize's `UnifiedEvent` / `EventStreamAdapter` models telemetry as a serializable stream feeding pure generators. |
 | III. Native Stack First | First-party frameworks; hardware encode; runtime capability detection with fallback across Macs and macOS versions | **PASS.** All encoders are VideoToolbox, hardware on the reference machine with software fallback (R-006). |
 | IV. Local-Only | No analytics, crash reporting, update pings, or outbound calls | **FAIL in upstream — fixed by this plan.** See Gate B. |
@@ -94,16 +94,17 @@ Overlay as reduced before recording, and — because a creator can still turn th
 on — marks every overlaid stretch of the screen track and tells the creator. The constitution
 permits this, since it allows Presenter Overlay but does not require it.
 
-Gate C decides the screen-stream branch only. The spike also found that the application's
-camera movie output stops when the effect starts. Principle I and FR-073 require the camera
-recording in full in every case; that conflict stays open in R-009 until FR-073 and SC-013 are
-verified.
+Gate C decides the screen-stream branch only. For the camera, the spike found that the movie
+file output ends shortly after the effect starts and does not continue through it and that a data output keeps delivering buffers, with
+one gap of about 0.57 s after the first effect start. The camera is captured through the data
+output (R-009). Principle I and FR-073 require the camera recording in full in every case; the
+gap and the writer path's validation (T148) stay open until FR-073 and SC-013 are verified.
 
 A composited frame is never dropped or cleaned after the fact; it is marked in the screen track.
 
 ### Post-Phase-1 re-check
 
-Re-evaluated after the design below. Gate C is closed on the fallback, and the camera loss under Presenter Overlay is open (R-009). Screenize's
+Re-evaluated after the design below. Gate C is closed on the fallback; the camera is captured through a data output, and its gap under Presenter Overlay is open (R-009, T148). Screenize's
 generators assume their own event model; an adapter at the telemetry boundary handles that,
 preserving their tests (Principle II, and the quality gate requiring automated tests for pure
 logic). Camera switching, screen size changes, Presenter Overlay, and ProRes export add

@@ -180,7 +180,8 @@ source is separately playable and the camera is separable from the screen.
 - [ ] T065 [P] [US1] Implement application capture following its windows in `apps/macos/Sources/RecordMac/Capture/Sources/ApplicationSource.swift` (FR-003)
 - [ ] T066 [P] [US1] Implement interactive region capture in `apps/macos/Sources/RecordMac/Capture/Sources/RegionSource.swift` with pre-recording adjustment (FR-004, FR-006)
 - [ ] T067 [P] [US1] Implement attached mobile device capture in `apps/macos/Sources/RecordMac/Capture/Sources/DeviceSource.swift`, mapped onto the session epoch and reporting its own refresh rate (FR-005)
-- [ ] T068 [US1] Implement camera capture in `apps/macos/Sources/RecordMac/Capture/CameraCapture.swift`, supporting built-in, external, and iPhone cameras, with mid-recording switching that ends the current `MediaSegment` and starts a new one at the new device's native format, never scaling at capture, and handling a camera taken by another application mid-session as a disconnect (FR-009, FR-010, FR-011, Principle I)
+- [ ] T068 [US1] Implement camera capture in `apps/macos/Sources/RecordMac/Capture/CameraCapture.swift`, supporting built-in, external, and iPhone cameras, with mid-recording switching that ends the current `MediaSegment` and starts a new one at the new device's native format, never scaling at capture, and handling a camera taken by another application mid-session as a disconnect; capture through `AVCaptureVideoDataOutput` into an `AVAssetWriter`, never `AVCaptureMovieFileOutput`, which stops while Presenter Overlay is on (FR-009, FR-010, FR-011, Principle I, research.md R-009)
+- [ ] T148 [US1] Validate the camera path under Presenter Overlay on the reference machine, after T068 and T040: with the effect small, large, off, turned on and off repeatedly, and across pause and resume, under concurrent screen and audio encoding, count delivered, accepted, and written camera frames, check that the decoded camera image is the uncomposited camera, that presentation times are kept across the gap after the first effect start, that the file plays after finalisation, and that the camera aligns with the screen and audio tracks; record the result in `docs/verification/camera-presenter-overlay.md`. The gap of about 0.57 s after the first effect start is a loss under FR-073 and stays open unless removed or explicitly accepted (research.md R-009, FR-073, SC-013, Principle I)
 - [ ] T069 [US1] Implement a live camera preview that is excluded from the captured screen video in `apps/macos/Sources/RecordMac/Capture/CameraPreview.swift` (FR-012)
 - [ ] T070 [US1] Implement driver-free system audio capture with an on/off option in `apps/macos/Sources/RecordMac/Capture/SystemAudioCapture.swift` (FR-016)
 - [ ] T071 [P] [US1] Implement live input level metering in `apps/macos/Sources/RecordMac/Capture/AudioLevelMeter.swift` so a dead microphone is noticed during recording (FR-020)
@@ -369,6 +370,7 @@ inside the application.
 - **Merge-condition prerequisites**: T012 precedes T013; T052 precedes the first change that
   alters rendered output
 - **Within Phase 2**: T036 depends on T053; T037 precedes T038 and T053
+- **Within US1**: T148 follows T068 and T040
 
 ### User Story Dependencies
 

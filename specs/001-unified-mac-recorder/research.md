@@ -270,14 +270,17 @@ does not keep the screen track clean.
   attachment alone misses runs of about one second when the effect changes size. Dropping
   those frames instead would break capture continuity and the frame budget, and a composited
   frame cannot be cleaned after the fact.
-- *Camera while the effect is on*: in the spike, the application's
-  `AVCaptureMovieFileOutput` stopped within 0.3 s of the effect starting; the file ended
-  with "Recording Stopped" marked as successfully finished, and no camera recording ran for the
-  rest of the session. This conflicts with FR-073, which requires the camera recording in full
-  in every case, and the conflict is open. The engine handles the loss as a camera taken by
-  another application under contracts/capture-engine.md: it continues the other tracks and
-  marks the camera track ended early, or records the gap if the camera returns. Whether any other camera output keeps frames while the
-  effect is on is untested.
+- *Camera while the effect is on*: on the reference machine, `AVCaptureVideoDataOutput`
+  delivered buffers throughout the measured effect spans, with one presentation-time gap of
+  about 0.57 s after the first effect start in each of two measured runs.
+  `AVCaptureMovieFileOutput` ended shortly after every effect start, its file finished with
+  "Recording Stopped" marked as successful, and no movie recording resumed before the effect
+  stopped. The camera is
+  therefore captured through the data output into the application's own `AVAssetWriter`, never
+  the movie file output. The gap is a loss of camera time that FR-073 does not allow, and it
+  stays open until it is removed or explicitly accepted. Whether the delivered buffers make a
+  usable, uncomposited camera recording, written without loss and aligned with the other
+  tracks, is unverified (T148).
 - *Rejected candidate*: two concurrent screen streams over the same content filter, the clean
   one writing the `screen` track and the other receiving the composite for the preview and the
   `presenterComposite` track.
