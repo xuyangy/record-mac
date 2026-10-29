@@ -61,7 +61,7 @@ Checked against constitution 2.0.0.
 
 | Principle | Gate | Status |
 |---|---|---|
-| I. Capture Fidelity | Capture written as captured; effects render-time only; mic/system audio never merged at capture; preview degrades before capture drops | **PASS by design, Presenter Overlay conditional.** Separate `AVAssetWriterInput`s for screen, mic, and system audio; screen and camera segmented at native format. Presenter Overlay passes only once Gate C's spike proves the clean stream stays clean (R-009). |
+| I. Capture Fidelity | Capture written as captured; effects render-time only; mic/system audio never merged at capture; preview degrades before capture drops | **PASS by design for the screen track; camera continuity under Presenter Overlay open.** Separate `AVAssetWriterInput`s for screen, mic, and system audio; screen and camera segmented at native format. Presenter Overlay takes the fallback closed by Gate C; the camera loss while the effect is on is open (R-009). |
 | II. Stage Separation | Capture, Telemetry, Render separated by serializable contracts | **PASS by design.** Screenize's `UnifiedEvent` / `EventStreamAdapter` models telemetry as a serializable stream feeding pure generators. |
 | III. Native Stack First | First-party frameworks; hardware encode; runtime capability detection with fallback across Macs and macOS versions | **PASS.** All encoders are VideoToolbox, hardware on the reference machine with software fallback (R-006). |
 | IV. Local-Only | No analytics, crash reporting, update pings, or outbound calls | **FAIL in upstream — fixed by this plan.** See Gate B. |
@@ -80,29 +80,30 @@ binary references no network symbol, plus a source scan for `URLSession`, is add
 gate (see `quickstart.md`). No functional requirement depends on updating or captions; FR-068 and
 FR-069 forbid the first, and the spec puts the second out of scope.
 
-### Gate C — Presenter Overlay must not reach the clean tracks (open, conditional)
+### Gate C — Presenter Overlay must not reach the clean tracks (closed: fallback)
 
 Principle I requires the clean screen track and the separate camera track even while the system
-composites the creator over the screen. The candidate design captures two concurrent streams and
-writes the composite only to the preview and an optional extra track (R-009). Whether a second
-stream stays clean through every transition is unverified.
+composites the creator over the screen. The rejected candidate uses two concurrent streams and
+writes the composite only to the preview and an optional extra track (R-009).
 
-This gate stays open until the spike in R-009 runs on the reference machine, and no other
-Presenter Overlay work starts before it:
+The spike in R-009 ran on the reference machine
+(`docs/verification/presenter-overlay-spike.md`). The system composited the stream meant to stay
+clean on 7,762 frames, so the two-stream design is not used and the gate passes on the fallback:
+the application draws its own live composite from the screen and camera, reports Presenter
+Overlay as reduced before recording, and — because a creator can still turn the system effect
+on — marks every overlaid stretch of the screen track and tells the creator. The constitution
+permits this, since it allows Presenter Overlay but does not require it.
 
-- **Clean every frame**: the two-stream design is adopted and the gate passes.
-- **Composite reaches the clean stream**: the two-stream design is dropped. The application
-  draws its own live composite from the screen and camera, reports Presenter Overlay as reduced
-  before recording, and — because a creator can still turn the system effect on — marks every
-  overlaid stretch of the screen track and tells the creator. The gate passes on that fallback,
-  which the constitution permits since it allows Presenter Overlay but does not require it.
+Gate C decides the screen-stream branch only. The spike also found that the application's
+camera movie output stops when the effect starts. Principle I and FR-073 require the camera
+recording in full in every case; that conflict stays open in R-009 until FR-073 and SC-013 are
+verified.
 
-In neither case is a composited frame dropped or cleaned after the fact; it is either kept out of
-the screen track or marked there.
+A composited frame is never dropped or cleaned after the fact; it is marked in the screen track.
 
 ### Post-Phase-1 re-check
 
-Re-evaluated after the design below. No new violations; Gate C remains open as stated. Screenize's
+Re-evaluated after the design below. Gate C is closed on the fallback, and the camera loss under Presenter Overlay is open (R-009). Screenize's
 generators assume their own event model; an adapter at the telemetry boundary handles that,
 preserving their tests (Principle II, and the quality gate requiring automated tests for pure
 logic). Camera switching, screen size changes, Presenter Overlay, and ProRes export add
@@ -190,5 +191,4 @@ Wiring Screenize's renderer into the application would need this plan amended fi
 |---|---|---|
 | Three upstream codebases in one module | Each owns a distinct stage the feature needs, and the constitution fixes the baseline and derivation modes | Building one stage from scratch would discard Screenize's tested generators, which the quality gate requires be tested; splitting into SwiftPM modules would require rewriting upstream access levels across ~280 files before anything runs |
 | Swift 5 language mode on a Swift 6 toolchain | Screenize and QuickRecorder are Swift 5 code; one target has one mode | Swift 6 mode turns every strict-concurrency diagnostic in the vendored Swift 5 files into an error before anything runs |
-| Two concurrent screen streams while Presenter Overlay is on (if Gate C's spike adopts it) | Principle I keeps the clean screen and camera tracks while the system composites the creator | Writing the composite into the screen track, as QuickRecorder does, bakes the camera into the capture |
 | Carrying QuickRecorder's third-party deps | KeyboardShortcuts backs FR-064 and FR-065; SwiftLAME backs MP3 under FR-021 | Reimplementing global hotkeys and an MP3 encoder is out of proportion to the feature, and both are recorded and license-checked in `UPSTREAM.md` |

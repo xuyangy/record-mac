@@ -256,22 +256,31 @@ cleared the target's mode can be raised to 6 in one manifest change.
 
 ## R-009: Presenter Overlay
 
-**Decision**: Treat clean Presenter Overlay support as unproven until a spike on the reference
-machine measures it, and design for both outcomes.
+**Decision**: Fallback. One clean stream writes the `screen` track; the application draws a
+live composite from the screen and camera for the creator to watch, and reports Presenter Overlay
+as reduced under FR-071 before recording starts. The spike on the reference machine
+(`docs/verification/presenter-overlay-spike.md`) found the system composites whichever of the
+application's streams it chooses, including the one meant to stay clean, so a second stream
+does not keep the screen track clean.
 
-- *Candidate design*: two concurrent screen streams over the same content filter. The clean
-  stream writes the `screen` track; the overlay stream receives the system composite and feeds
-  the live preview and, when the creator asks, the `presenterComposite` track. Audio is taken
-  from the clean stream only. Both streams map onto the session epoch. The composite path has a
-  bounded queue and is shed before any clean-stream work.
-- *Fallback*: one clean stream, and a live composite drawn by the application from the screen
-  and camera for the creator to watch. Presenter Overlay is reported as reduced under FR-071
-  before recording starts.
-- *Unexpected activation*: the clean stream carries `presenterOverlayContentRect` on every frame.
-  When that attachment shows the overlay engaged on the clean stream, the engine keeps writing
-  every frame, records the affected time range in the project, and tells the creator. Dropping
+- *Unexpected activation*: the creator can still turn the system effect on. The engine keeps
+  writing every frame, records each overlaid time range in the project, and tells the creator.
+  A range runs from `outputVideoEffectDidStart(for:)` to `outputVideoEffectDidStop(for:)` on the
+  screen stream, widened to any frame whose `presenterOverlayContentRect` is engaged; the
+  attachment alone misses runs of about one second when the effect changes size. Dropping
   those frames instead would break capture continuity and the frame budget, and a composited
   frame cannot be cleaned after the fact.
+- *Camera while the effect is on*: in the spike, the application's
+  `AVCaptureMovieFileOutput` stopped within 0.3 s of the effect starting; the file ended
+  with "Recording Stopped" marked as successfully finished, and no camera recording ran for the
+  rest of the session. This conflicts with FR-073, which requires the camera recording in full
+  in every case, and the conflict is open. The engine handles the loss as a camera taken by
+  another application under contracts/capture-engine.md: it continues the other tracks and
+  marks the camera track ended early, or records the gap if the camera returns. Whether any other camera output keeps frames while the
+  effect is on is untested.
+- *Rejected candidate*: two concurrent screen streams over the same content filter, the clean
+  one writing the `screen` track and the other receiving the composite for the preview and the
+  `presenterComposite` track.
 
 **Evidence**: Presenter Overlay is a system video effect that the creator turns on from the
 operating system's video effects controls while the application uses the camera. The system
@@ -292,16 +301,18 @@ design and gives a per-stream signal beside the frame attachment. It does not es
 second stream of the same application stays clean through every transition. `SCVideoEffectOutput` is not an alternative: the macOS SDK marks
 `addVideoEffectOutput` unavailable on macOS.
 
-**Spike**: on the reference machine, run two named streams and check every frame of the clean
-stream, not a final screenshot, across: small, large, and off transitions; the creator selecting
-the other stream in the system controls; content-filter and source changes; pause and resume;
-camera switch and disconnect; and repeated activation. Confirm the independent camera recording
-stays usable while the system effect is on. The candidate design is adopted only if no clean
-frame ever carries the composite; otherwise the fallback is.
+**Spike**: two named streams over one display filter, with every complete frame logged, across
+small, large, and off transitions; the other stream selected in the system Video menu; filter and
+source changes; pause and resume; and repeated activation. Of the first generation's clean
+stream, 7,762 of 8,307 complete frames carried an engaged rect, while its `overlay` stream
+carried none; after pause and resume and the other stream's selection, the roles swapped. The
+effect callbacks arrived on the composited stream only.
 
 **Rationale**: Principle I requires the clean screen track and the separate camera track. The
-constitution permits Presenter Overlay but does not require it, so the fallback is compliant, and
-FR-073 states the behaviour the creator sees in each case.
+constitution permits Presenter Overlay but does not require it, so the fallback meets
+Principle I for the screen track, and FR-073 states the behaviour the creator sees in each case.
+The camera track is not settled: Principle I and FR-073 require it in full, and the camera loss
+above stays open until FR-073 and SC-013 are verified.
 
 ## R-010: Upstream baselines
 
