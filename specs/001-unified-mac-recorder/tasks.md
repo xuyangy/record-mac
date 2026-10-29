@@ -110,7 +110,7 @@ Presenter Overlay spike that decides the capture design.
 
 ### Capture engine (from QuickRecorder)
 
-- [ ] T028 Delete open-recorder's `SCRecordingOutput` path, including `RecordingOutputDelegate` and its sidecar audio outputs, from `apps/macos/Sources/RecordMac/Capture/NativeScreenRecorder.swift` (research.md R-001)
+- [X] T028 Delete open-recorder's `SCRecordingOutput` path, including `RecordingOutputDelegate` and its sidecar audio outputs, from `apps/macos/Sources/RecordMac/Capture/NativeScreenRecorder.swift` (research.md R-001)
 - [ ] T029 Adapt QuickRecorder's `RecordEngine.swift` and `SCContext.swift` into `apps/macos/Sources/RecordMac/Capture/`: rename to the merged module; remove every Sparkle, `AECAudioStream`, and `MatrixColorSelector` import and caller; replace `CMTime(value: 1, timescale: 0)` with `CMTime(value: 1, timescale: fps)` for the chosen rate; remove the `if isPresenterON && !isCameraReady { break }` frame drop; and record each change in `UPSTREAM.md` (research.md R-005, R-009, R-011)
 - [ ] T030 [P] Adapt QuickRecorder's `ViewModel/AreaSelector.swift`, `ViewModel/WinSelector.swift`, `ViewModel/AppSelector.swift`, and `ViewModel/iDeviceSelector.swift` into `apps/macos/Sources/RecordMac/Capture/`, removing every Sparkle or updater import and caller
 - [ ] T031 Implement the `offers` / `prepare` / `start` / `pause` / `resume` / `stop` interface and its legal transitions from contracts/capture-engine.md in `apps/macos/Sources/RecordMac/Capture/CaptureEngine.swift`

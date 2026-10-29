@@ -106,6 +106,17 @@ Removed after vendoring:
   dialog's "Include captions" option. The inspector's audio inputs are renamed `audioEdits` and
   `audioPlayback`. A project saved by open-recorder with captions opens here without them, and
   saving it drops its caption field.
+- The `SCRecordingOutput` recording path (research.md R-001): in
+  `Capture/NativeScreenRecorder.swift`, the `RecordingOutputDelegate` class, the
+  `SCRecordingOutput` and its configuration, the start clock and the per-source audio outputs
+  added to the stream, the stream start and stop, and the audio replacement at stop. `start` now
+  fails with `NativeScreenRecorderError.recordingEngineUnavailable` before creating a stream or
+  a file, `stop` does nothing, and the unused `recordingOutputUnavailable` error is gone; the
+  source, filter, and stream-configuration helpers stay. `NativeScreenRecorderErrorTests.swift`
+  checks that starting fails with that reason, creates no file, and leaves the controller not
+  recording. Comments in `Capture/ScreenCaptureAudioTrack.swift` and
+  `Capture/MicrophoneCaptureDiagnostic.swift`, and a message in
+  `ScreenCaptureAudioMuxerTests.swift`, no longer name `SCRecordingOutput`.
 
 Still carrying upstream names, until the project format task (T021) replaces them: the
 `.openrecorder` project extension and its document type, the `dev.openrecorder.*` logger

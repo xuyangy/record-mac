@@ -2,9 +2,9 @@
 @preconcurrency import ScreenCaptureKit
 import Foundation
 
-/// Records one ScreenCaptureKit audio source using its actual format description.
-/// Kept separately from SCRecordingOutput so microphone and system audio never
-/// share format assumptions. All mutable state is confined to sampleQueue.
+/// Records one ScreenCaptureKit audio source using its actual format description,
+/// in its own file, so microphone and system audio never share format assumptions.
+/// All mutable state is confined to sampleQueue.
 final class ScreenCaptureAudioTrack: NSObject, SCStreamOutput, @unchecked Sendable {
     let sampleQueue = DispatchQueue(label: "dev.openrecorder.native-audio-track")
     let audioURL: URL

@@ -10,7 +10,7 @@ enum NativeScreenRecorderError: LocalizedError {
     case windowIdentityChanged(expected: String?, actual: String?)
     case selfCaptureUnsupported
     case unsupportedSource
-    case recordingOutputUnavailable
+    case recordingEngineUnavailable
 
     var errorDescription: String? {
         switch self {
@@ -26,93 +26,23 @@ enum NativeScreenRecorderError: LocalizedError {
             return "Open Recorder windows are excluded from recordings."
         case .unsupportedSource:
             return "Selected-area video recording requires a valid area selection."
-        case .recordingOutputUnavailable:
-            return "ScreenCaptureKit recording output is not available on this macOS version."
+        case .recordingEngineUnavailable:
+            return "Recording is not available in this build: the capture engine is not built yet."
         }
     }
 }
 
+/// Resolves capture sources to ScreenCaptureKit filters and stream configurations. It records
+/// nothing: `start` fails before creating a stream or a file until the capture engine records
+/// (research.md R-001).
 @MainActor
 final class NativeScreenRecorder: NSObject {
-    private var stream: SCStream?
-    private var recordingOutput: SCRecordingOutput?
-    private var recordingDelegate: RecordingOutputDelegate?
-    private var startClock: ScreenCaptureStartClock?
-    private var audioTracks: [ScreenCaptureAudioTrack] = []
-    private var captureURL: URL?
-    private var mediaStartedAt: Date?
-
     func start(
         source: CaptureSource,
         outputURL: URL,
         options: RecordingCaptureOptions
     ) async throws -> Date {
-        let content = try await shareableContent()
-        let filterAndSize = try makeFilter(for: source, from: content)
-
-        let configuration = Self.makeStreamConfiguration(
-            width: filterAndSize.width,
-            height: filterAndSize.height,
-            sourceRect: filterAndSize.sourceRect,
-            options: options
-        )
-
-        let outputConfiguration = SCRecordingOutputConfiguration()
-        outputConfiguration.outputURL = outputURL
-        outputConfiguration.outputFileType = .mp4
-        outputConfiguration.videoCodecType = .h264
-
-        let recordingDelegate = RecordingOutputDelegate()
-        let recordingOutput = SCRecordingOutput(
-            configuration: outputConfiguration,
-            delegate: recordingDelegate
-        )
-        let stream = SCStream(
-            filter: filterAndSize.filter,
-            configuration: configuration,
-            delegate: nil
-        )
-
-        let startClock = ScreenCaptureStartClock()
-        try stream.addStreamOutput(startClock, type: .screen, sampleHandlerQueue: startClock.sampleQueue)
-        self.startClock = startClock
-        try stream.addRecordingOutput(recordingOutput)
-
-        // SCRecordingOutput combines audio internally. Preserve each SCK source
-        // independently using its native format, then replace that combined audio.
-        if options.includeMicrophone {
-            let directory = outputURL.deletingLastPathComponent().appendingPathComponent("Audio Sources")
-            for type in options.includeSystemAudio ? [SCStreamOutputType.microphone, .audio] : [.microphone] {
-                let track = try ScreenCaptureAudioTrack(directory: directory,
-                    name: outputURL.deletingPathExtension().lastPathComponent.trimmingCharacters(in: CharacterSet(charactersIn: ".")) + (type == .microphone ? "-microphone" : "-system"), outputType: type)
-                try stream.addStreamOutput(track, type: type, sampleHandlerQueue: track.sampleQueue)
-                audioTracks.append(track)
-            }
-        }
-        captureURL = outputURL
-
-
-        self.stream = stream
-        self.recordingOutput = recordingOutput
-        self.recordingDelegate = recordingDelegate
-
-        do {
-            try await startCapture(stream)
-            let notifiedAt = try await recordingDelegate.waitForStart()
-            let startedAt = try await startClock.startDate(fallback: notifiedAt)
-            mediaStartedAt = startedAt
-            for track in audioTracks { try await track.waitForFirstSamples() }
-            return startedAt
-        } catch {
-            try? await stopCapture(stream)
-            self.stream = nil
-            self.recordingOutput = nil
-            self.recordingDelegate = nil
-            self.startClock = nil
-            for track in audioTracks { await track.finish() }
-            audioTracks = []
-            throw error
-        }
+        throw NativeScreenRecorderError.recordingEngineUnavailable
     }
 
     static func makeStreamConfiguration(
@@ -150,35 +80,8 @@ final class NativeScreenRecorder: NSObject {
         return clamped.isMultiple(of: 2) ? clamped : clamped + 1
     }
 
-    func stop() async throws {
-        guard let stream else {
-            return
-        }
-
-        defer {
-            self.stream = nil
-            recordingOutput = nil
-            recordingDelegate = nil
-            startClock = nil
-            audioTracks = []
-            captureURL = nil
-            mediaStartedAt = nil
-        }
-        do {
-            try await stopCapture(stream)
-        } catch {
-            for track in audioTracks { await track.finish() }
-            throw error
-        }
-        for track in audioTracks { await track.finish() }
-        try await recordingDelegate?.waitForFinish()
-        if !audioTracks.isEmpty, let captureURL, let mediaStartedAt {
-            var sources: [ScreenCaptureAudioTrack.Result] = []
-            for track in audioTracks { sources.append(try await track.result()) }
-            try await ScreenCaptureAudioMuxer.replaceAudio(in: captureURL, sources: sources, videoStartedAt: mediaStartedAt)
-        }
-
-    }
+    /// Nothing is started, so there is nothing to stop.
+    func stop() async throws {}
 
     private func shareableContent() async throws -> SCShareableContent {
         try await withCheckedThrowingContinuation { continuation in
@@ -346,87 +249,5 @@ final class NativeScreenRecorder: NSObject {
             width: max(width, 2),
             height: max(height, 2)
         )
-    }
-
-    private func startCapture(_ stream: SCStream) async throws {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            stream.startCapture { error in
-                if let error {
-                    continuation.resume(throwing: error)
-                } else {
-                    continuation.resume()
-                }
-            }
-        }
-    }
-
-    private func stopCapture(_ stream: SCStream) async throws {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            stream.stopCapture { error in
-                if let error {
-                    continuation.resume(throwing: error)
-                } else {
-                    continuation.resume()
-                }
-            }
-        }
-    }
-}
-
-@available(macOS 15.0, *)
-private final class RecordingOutputDelegate: NSObject, SCRecordingOutputDelegate, @unchecked Sendable {
-    private var startContinuation: CheckedContinuation<Date, Error>?
-    private var finishContinuation: CheckedContinuation<Void, Error>?
-    private var startedAt: Date?
-    private var didFinish = false
-    private var failure: Error?
-
-    func waitForStart() async throws -> Date {
-        if let failure {
-            throw failure
-        }
-        if let startedAt {
-            return startedAt
-        }
-        return try await withCheckedThrowingContinuation { continuation in
-            startContinuation = continuation
-        }
-    }
-
-    func waitForFinish() async throws {
-        if let failure {
-            throw failure
-        }
-        if didFinish {
-            return
-        }
-        try await withCheckedThrowingContinuation { continuation in
-            finishContinuation = continuation
-        }
-    }
-
-    func fail(_ error: Error) {
-        failure = error
-        startContinuation?.resume(throwing: error)
-        startContinuation = nil
-        finishContinuation?.resume(throwing: error)
-        finishContinuation = nil
-    }
-
-    func recordingOutputDidStartRecording(_ recordingOutput: SCRecordingOutput) {
-        let start = Date()
-        startedAt = start
-        startContinuation?.resume(returning: start)
-        startContinuation = nil
-    }
-
-    func recordingOutputDidFinishRecording(_ recordingOutput: SCRecordingOutput) {
-        didFinish = true
-        finishContinuation?.resume()
-        finishContinuation = nil
-    }
-
-    func recordingOutput(_ recordingOutput: SCRecordingOutput, didFailWithError error: Error) {
-        fail(error)
     }
 }

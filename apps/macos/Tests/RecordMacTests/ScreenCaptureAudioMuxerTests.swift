@@ -48,7 +48,7 @@ final class ScreenCaptureAudioMuxerTests: XCTestCase {
         XCTAssertLessThan(magnitude(440, start: 0.2), 0.01)
         XCTAssertGreaterThan(magnitude(440, start: 0.32), 0.15, "The mic cue starts at .1 + .2 seconds")
         XCTAssertGreaterThan(magnitude(880, start: 0.32), 0.07, "System audio at a different sample rate must remain audible")
-        XCTAssertLessThan(magnitude(1000, start: 0.72), 0.01, "Original SCRecordingOutput audio must be removed")
+        XCTAssertLessThan(magnitude(1000, start: 0.72), 0.01, "The video file's original audio must be removed")
         XCTAssertTrue(FileManager.default.fileExists(atPath: mic.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: system.path))
     }

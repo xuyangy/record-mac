@@ -3,8 +3,8 @@
 @preconcurrency import ScreenCaptureKit
 import Foundation
 
-/// A development-only comparison of ScreenCaptureKit's native microphone buffers
-/// with SCRecordingOutput. All mutable state is confined to sampleQueue.
+/// A development-only record of ScreenCaptureKit's native microphone buffers.
+/// All mutable state is confined to sampleQueue.
 final class MicrophoneCaptureDiagnostic: NSObject, SCStreamOutput, @unchecked Sendable {
     let sampleQueue = DispatchQueue(label: "dev.openrecorder.microphone-diagnostic")
     let audioURL: URL
