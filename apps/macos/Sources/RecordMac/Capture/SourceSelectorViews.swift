@@ -16,26 +16,33 @@ struct SourceSelectorWindowView: View {
     }
 
     var body: some View {
-        SourceSelectorCard(
-            sourceTab: sourceSelector.sourceTabBinding,
-            visibleTabs: sourceSelector.state.visibleTabs,
-            allSources: model.capture.sources,
-            selectedSourceID: sourceSelector.state.pendingSourceID,
-            captureMode: model.captureMode,
-            loadPhase: sourceSelector.state.loadPhase,
-            onCancel: {
-                sourceSelector.send(.cancelRequested)
-            },
-            onRefresh: {
-                sourceSelector.send(.refreshRequested)
-            },
-            onSelectSource: { source in
-                sourceSelector.send(.sourceSelected(source.id))
-            },
-            onDrawArea: {
-                sourceSelector.send(.drawAreaRequested)
-            }
-        )
+        VStack(spacing: 0) {
+            CapabilityBanner(
+                model: model.capabilityBanner,
+                insets: EdgeInsets(
+                    top: SourceSelectorWindowMetrics.outerPadding, leading: SourceSelectorWindowMetrics.outerPadding,
+                    bottom: 0, trailing: SourceSelectorWindowMetrics.outerPadding))
+            SourceSelectorCard(
+                sourceTab: sourceSelector.sourceTabBinding,
+                visibleTabs: sourceSelector.state.visibleTabs,
+                allSources: model.capture.sources,
+                selectedSourceID: sourceSelector.state.pendingSourceID,
+                captureMode: model.captureMode,
+                loadPhase: sourceSelector.state.loadPhase,
+                onCancel: {
+                    sourceSelector.send(.cancelRequested)
+                },
+                onRefresh: {
+                    sourceSelector.send(.refreshRequested)
+                },
+                onSelectSource: { source in
+                    sourceSelector.send(.sourceSelected(source.id))
+                },
+                onDrawArea: {
+                    sourceSelector.send(.drawAreaRequested)
+                }
+            )
+        }
         .frame(width: SourceSelectorWindowMetrics.width, height: SourceSelectorWindowMetrics.height)
         .background {
             ZStack {

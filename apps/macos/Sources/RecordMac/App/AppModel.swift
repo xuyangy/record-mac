@@ -246,6 +246,7 @@ final class AppModel: ObservableObject {
     let service: RustServiceClient
     let capture: CaptureController
     let appShell = AppShellDriver()
+    let capabilityBanner = CapabilityBannerModel()
     var captureMachine: CaptureDriver { appShell.capture }
     var captureOptions: CaptureOptionsDriver { appShell.captureOptions }
     var videoExport: VideoExportDriver { appShell.workspace(for: nil).videoExport }
@@ -840,6 +841,7 @@ final class AppModel: ObservableObject {
 
     func bootstrap() {
         presentOnboardingIfNeeded()
+        capabilityBanner.detectAtLaunch()
         Task {
             await refreshSources()
             refreshCaptureDevices()
