@@ -4,15 +4,18 @@
 // the same display filter. The creator turns Presenter Overlay on from the system Video menu and
 // chooses which stream receives it. For every complete frame of each stream the spike logs the
 // stream name, presentation timestamp, and SCStreamFrameInfo.presenterOverlayContentRect, and it
-// saves one frame per second of each stream as PNG. The camera is written to its own movie file
-// so its usability while the effect is on can be checked afterwards.
+// saves one frame per second of each stream as PNG. The camera feeds a movie file, a frame
+// counter, or both, chosen with --camera-output movie+data|data|movie (default movie+data), so
+// whether any camera output keeps delivering while the effect is on can be checked afterwards.
 //
 // Output, under --output DIR or ~/Movies/PresenterOverlaySpike/<timestamp>/:
-//   events.log       permissions, stream lifecycle, effect start and stop, camera changes
-//   frames.jsonl     one line per complete frame of either stream
-//   clean/, overlay/ one PNG per second of each stream
-//   camera-N.mov     the camera recording, a new file after each camera switch
-//   summary.json     per-stream frame counts, written on quit
+//   events.log          permissions, stream lifecycle, effect start and stop, camera changes;
+//                       each line carries the wall-clock time and the host-clock time
+//   frames.jsonl        one line per complete frame of either stream
+//   camera-frames.jsonl one line per second of host time with the camera frame counter's totals
+//   clean/, overlay/    one PNG per second of each stream
+//   camera-N.mov        the camera recording, a new file after each camera switch or recovery
+//   summary.json        per-stream frame counts and camera totals, written on quit
 
 import AppKit
 import AVFoundation
@@ -23,13 +26,16 @@ import UniformTypeIdentifiers
 
 // MARK: - Log
 
-/// Appends to events.log and frames.jsonl on one serial queue, so lines from the stream queues and
-/// the main thread never interleave.
+/// Appends to events.log, frames.jsonl, and camera-frames.jsonl on one serial queue, so lines from
+/// the stream and camera queues and the main thread never interleave.
 final class SpikeLog: @unchecked Sendable {
+    enum RecordFile { case screenFrames, cameraFrames }
+
     let directory: URL
     private let queue = DispatchQueue(label: "spike.log")
     private let events: FileHandle
     private let frames: FileHandle
+    private let cameraFrames: FileHandle
     private let timestampFormatter: ISO8601DateFormatter
     var onEvent: (@Sendable (String) -> Void)?
 
@@ -43,16 +49,22 @@ final class SpikeLog: @unchecked Sendable {
         }
         let eventsURL = directory.appendingPathComponent("events.log")
         let framesURL = directory.appendingPathComponent("frames.jsonl")
-        fileManager.createFile(atPath: eventsURL.path, contents: nil)
-        fileManager.createFile(atPath: framesURL.path, contents: nil)
+        let cameraFramesURL = directory.appendingPathComponent("camera-frames.jsonl")
+        for url in [eventsURL, framesURL, cameraFramesURL] {
+            fileManager.createFile(atPath: url.path, contents: nil)
+        }
         events = try FileHandle(forWritingTo: eventsURL)
         frames = try FileHandle(forWritingTo: framesURL)
+        cameraFrames = try FileHandle(forWritingTo: cameraFramesURL)
         timestampFormatter = ISO8601DateFormatter()
         timestampFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
     }
 
+    /// The host-clock time is the clock of the screen frames' timestamps and of the camera
+    /// timestamps mapped in camera-frames.jsonl, so events line up with both.
     func event(_ message: String) {
-        let line = "\(timestampFormatter.string(from: Date())) \(message)"
+        let host = CMClockGetTime(CMClockGetHostTimeClock()).seconds
+        let line = "\(timestampFormatter.string(from: Date())) host=\(String(format: "%.6f", host)) \(message)"
         queue.async {
             self.events.write(Data((line + "\n").utf8))
             print(line)
@@ -60,12 +72,13 @@ final class SpikeLog: @unchecked Sendable {
         }
     }
 
-    func frame(_ record: [String: Any]) {
+    func record(_ record: [String: Any], to file: RecordFile) {
         guard let data = try? JSONSerialization.data(withJSONObject: record, options: [.sortedKeys])
         else { return }
         queue.async {
-            self.frames.write(data)
-            self.frames.write(Data("\n".utf8))
+            let handle = file == .screenFrames ? self.frames : self.cameraFrames
+            handle.write(data)
+            handle.write(Data("\n".utf8))
         }
     }
 
@@ -73,6 +86,7 @@ final class SpikeLog: @unchecked Sendable {
         queue.sync {
             try? events.synchronize()
             try? frames.synchronize()
+            try? cameraFrames.synchronize()
         }
     }
 }
@@ -89,6 +103,8 @@ final class StreamProbe: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked 
     private let lock = NSLock()
     private var lastSavedSecond = Int.min
     private(set) var counts = FrameCounts()
+    /// Called with true on outputVideoEffectDidStart and false on outputVideoEffectDidStop.
+    var onEffectChange: (@Sendable (Bool) -> Void)?
 
     struct FrameCounts {
         var complete = 0
@@ -150,7 +166,7 @@ final class StreamProbe: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked 
         var record: [String: Any] = [
             "stream": name,
             "generation": generation,
-            "pts": Self.number(pts.seconds),
+            "pts": jsonNumber(pts.seconds),
             "ptsValue": pts.value,
             "ptsTimescale": pts.timescale,
             "presenterOverlayContentRect": Self.describe(overlayValue: overlayValue, rect: overlayRect),
@@ -162,7 +178,7 @@ final class StreamProbe: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked 
             record["pixelHeight"] = CVPixelBufferGetHeight(pixelBuffer)
             if saveThisFrame { save(pixelBuffer, pts: pts) }
         }
-        log.frame(record)
+        log.record(record, to: .screenFrames)
     }
 
     func outputVideoEffectDidStart(for stream: SCStream) {
@@ -170,6 +186,7 @@ final class StreamProbe: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked 
         counts.effectStarts += 1
         lock.unlock()
         log.event("[\(name) g\(generation)] outputVideoEffectDidStart")
+        onEffectChange?(true)
     }
 
     func outputVideoEffectDidStop(for stream: SCStream) {
@@ -177,6 +194,7 @@ final class StreamProbe: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked 
         counts.effectStops += 1
         lock.unlock()
         log.event("[\(name) g\(generation)] outputVideoEffectDidStop")
+        onEffectChange?(false)
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
@@ -223,14 +241,8 @@ final class StreamProbe: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked 
         return rect.isNull ? "null-rect" : array(rect)
     }
 
-    /// JSONSerialization throws an Objective-C exception on NaN and infinity, so those are
-    /// written as text.
-    private static func number(_ value: Double) -> Any {
-        value.isFinite ? value : String(describing: value)
-    }
-
     private static func array(_ rect: CGRect) -> [Any] {
-        [rect.origin.x, rect.origin.y, rect.size.width, rect.size.height].map { number(Double($0)) }
+        [rect.origin.x, rect.origin.y, rect.size.width, rect.size.height].map { jsonNumber(Double($0)) }
     }
 
     static func describe(_ status: SCFrameStatus) -> String {
@@ -246,6 +258,12 @@ final class StreamProbe: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked 
     }
 }
 
+/// JSONSerialization throws an Objective-C exception on NaN and infinity, so those are written as
+/// text.
+func jsonNumber(_ value: Double) -> Any {
+    value.isFinite ? value : String(describing: value)
+}
+
 /// Carries a frame to the PNG queue. ScreenCaptureKit does not reuse a delivered buffer while it
 /// is retained, and the PNG queue only reads it.
 struct UncheckedPixelBuffer: @unchecked Sendable {
@@ -254,25 +272,188 @@ struct UncheckedPixelBuffer: @unchecked Sendable {
 
 // MARK: - Camera
 
-/// Records the camera to camera-N.mov, starting a new file on each camera switch.
-@MainActor
-final class CameraRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
-    let session = AVCaptureSession()
-    private let output = AVCaptureMovieFileOutput()
+/// Which camera outputs the session carries. Adding an output can change how the session runs, so
+/// a result with both outputs is checked against each output alone.
+enum CameraOutputMode: String {
+    case movieAndData = "movie+data"
+    case dataOnly = "data"
+    case movieOnly = "movie"
+
+    var includesMovie: Bool { self != .dataOnly }
+    var includesData: Bool { self != .movieOnly }
+}
+
+/// Counts camera frames from an AVCaptureVideoDataOutput in one-second intervals of host time and
+/// keeps no image. Each line of camera-frames.jsonl holds the interval's frame and drop counts,
+/// drop reasons, the first and last presentation timestamps as delivered, the same two mapped from
+/// the session's synchronization clock to the host clock, the largest gap between consecutive
+/// timestamps, and the frame size. An interval with no frames is still written, so a stall shows
+/// as zero frames rather than as a missing line.
+final class CameraFrameProbe: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate,
+    @unchecked Sendable
+{
+    struct Totals {
+        var frames = 0
+        var drops = 0
+        var emptyIntervals = 0
+    }
+
+    private struct Interval {
+        var frames = 0
+        var drops = 0
+        var dropReasons: [String: Int] = [:]
+        var first: CMTime?
+        var last: CMTime?
+        var maxGapSeconds = 0.0
+        var width: Int32 = 0
+        var height: Int32 = 0
+    }
+
+    /// Delivery, the interval timer, and every read of the state below run on this queue.
+    let queue = DispatchQueue(label: "spike.camera.frames", qos: .userInitiated)
     private let log: SpikeLog
-    private var input: AVCaptureDeviceInput?
-    private var fileIndex = 0
-    private var observers: [NSObjectProtocol] = []
-    /// Files stopped on purpose by a switch or stop, whose finish needs no restart.
-    private var intentionalStops = Set<URL>()
-    private var restartsAfterFailure = 0
-    private var isPaused = false
-    /// A replacement file that was due while paused.
-    private var restartPendingResume = false
-    private static let maximumRestartsAfterFailure = 3
+    private var timer: DispatchSourceTimer?
+    private var synchronizationClock: CMClock?
+    private var interval = Interval()
+    private var previousPTS: CMTime?
+    private var totals = Totals()
 
     init(log: SpikeLog) {
         self.log = log
+    }
+
+    func start(synchronizationClock clock: UncheckedClock?) {
+        queue.async {
+            self.synchronizationClock = clock?.clock
+            let timer = DispatchSource.makeTimerSource(queue: self.queue)
+            timer.schedule(deadline: .now() + 1, repeating: 1)
+            // The probe lives for the process; stop() cancels the timer.
+            timer.setEventHandler { self.writeInterval() }
+            timer.resume()
+            self.timer = timer
+        }
+    }
+
+    func stop() {
+        queue.sync {
+            timer?.cancel()
+            timer = nil
+            writeInterval()
+        }
+    }
+
+    func snapshot() -> Totals {
+        queue.sync { totals }
+    }
+
+    func captureOutput(
+        _ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer,
+        from connection: AVCaptureConnection
+    ) {
+        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        interval.frames += 1
+        totals.frames += 1
+        if interval.first == nil { interval.first = pts }
+        interval.last = pts
+        if let previousPTS, pts.isNumeric, previousPTS.isNumeric {
+            let gap = (pts - previousPTS).seconds
+            if gap.isFinite { interval.maxGapSeconds = max(interval.maxGapSeconds, gap) }
+        }
+        previousPTS = pts
+        if let format = CMSampleBufferGetFormatDescription(sampleBuffer) {
+            let dimensions = CMVideoFormatDescriptionGetDimensions(format)
+            interval.width = dimensions.width
+            interval.height = dimensions.height
+        }
+    }
+
+    func captureOutput(
+        _ output: AVCaptureOutput, didDrop sampleBuffer: CMSampleBuffer,
+        from connection: AVCaptureConnection
+    ) {
+        let reason =
+            CMGetAttachment(
+                sampleBuffer, key: kCMSampleBufferAttachmentKey_DroppedFrameReason,
+                attachmentModeOut: nil) as? String ?? "unknown"
+        interval.drops += 1
+        interval.dropReasons[reason, default: 0] += 1
+        totals.drops += 1
+    }
+
+    private func writeInterval() {
+        var record: [String: Any] = [
+            "intervalEndHost": jsonNumber(CMClockGetTime(CMClockGetHostTimeClock()).seconds),
+            "frames": interval.frames,
+            "drops": interval.drops,
+            "maxGapSeconds": jsonNumber(interval.maxGapSeconds),
+        ]
+        if !interval.dropReasons.isEmpty { record["dropReasons"] = interval.dropReasons }
+        if let first = interval.first {
+            record["firstPts"] = describe(first)
+            record["firstPtsHost"] = hostSeconds(first)
+        }
+        if let last = interval.last {
+            record["lastPts"] = describe(last)
+            record["lastPtsHost"] = hostSeconds(last)
+        }
+        if interval.frames > 0 {
+            record["width"] = Int(interval.width)
+            record["height"] = Int(interval.height)
+        } else {
+            totals.emptyIntervals += 1
+        }
+        log.record(record, to: .cameraFrames)
+        interval = Interval()
+    }
+
+    private func describe(_ time: CMTime) -> [String: Any] {
+        ["value": time.value, "timescale": time.timescale, "seconds": jsonNumber(time.seconds)]
+    }
+
+    /// The timestamp on the host clock, or null when the session has no synchronization clock.
+    private func hostSeconds(_ time: CMTime) -> Any {
+        guard let synchronizationClock else { return NSNull() }
+        return jsonNumber(
+            CMSyncConvertTime(time, from: synchronizationClock, to: CMClockGetHostTimeClock()).seconds)
+    }
+}
+
+/// Carries the session's synchronization clock to the frame counter's queue.
+struct UncheckedClock: @unchecked Sendable {
+    let clock: CMClock
+}
+
+/// Runs the camera session with the outputs the mode asks for: camera-N.mov through
+/// AVCaptureMovieFileOutput, starting a new file on each camera switch, and the frame counter
+/// through AVCaptureVideoDataOutput.
+@MainActor
+final class CameraRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
+    let session = AVCaptureSession()
+    let mode: CameraOutputMode
+    let frameProbe: CameraFrameProbe
+    private let output = AVCaptureMovieFileOutput()
+    private let dataOutput = AVCaptureVideoDataOutput()
+    private let log: SpikeLog
+    private var input: AVCaptureDeviceInput?
+    private var movieAttached = false
+    private(set) var fileIndex = 0
+    private var observers: [NSObjectProtocol] = []
+    private var deviceObservation: NSKeyValueObservation?
+    /// Files stopped on purpose by a switch or stop, whose finish needs no restart.
+    private var intentionalStops = Set<URL>()
+    private var restartsAfterFailure = 0
+    private var recoveries = 0
+    private var isPaused = false
+    private var isStopping = false
+    /// A replacement file that was due while paused.
+    private var restartPendingResume = false
+    private static let maximumRestartsAfterFailure = 3
+    private static let maximumRecoveries = 3
+
+    init(log: SpikeLog, mode: CameraOutputMode) {
+        self.log = log
+        self.mode = mode
+        frameProbe = CameraFrameProbe(log: log)
         super.init()
         let center = NotificationCenter.default
         observers.append(
@@ -293,9 +474,32 @@ final class CameraRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
             center.addObserver(
                 forName: AVCaptureSession.runtimeErrorNotification, object: session, queue: .main
             ) { [log] note in
-                let error = note.userInfo?[AVCaptureSessionErrorKey] as? Error
-                log.event("camera session runtime error: \(error?.localizedDescription ?? "?")")
+                let error = note.userInfo?[AVCaptureSessionErrorKey] as? NSError
+                log.event("camera session runtime error: \(error?.domain ?? "?") \(error?.code ?? 0): \(error?.localizedDescription ?? "?")")
             })
+        // The interruption reason key is unavailable on macOS, so the whole user info is logged.
+        observers.append(
+            center.addObserver(
+                forName: AVCaptureSession.wasInterruptedNotification, object: session, queue: .main
+            ) { [log] note in
+                log.event("camera session interrupted: \(Self.describe(note.userInfo))")
+            })
+        observers.append(
+            center.addObserver(
+                forName: AVCaptureSession.interruptionEndedNotification, object: session, queue: .main
+            ) { [weak self] note in
+                let detail = Self.describe(note.userInfo)
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.log.event("camera session interruption ended: \(detail)")
+                    self.recoverMovie(after: "interruption end")
+                }
+            })
+    }
+
+    nonisolated private static func describe(_ userInfo: [AnyHashable: Any]?) -> String {
+        guard let userInfo, !userInfo.isEmpty else { return "no user info" }
+        return userInfo.map { "\($0.key)=\($0.value)" }.sorted().joined(separator: " ")
     }
 
     static func availableCameras() -> [AVCaptureDevice] {
@@ -316,11 +520,24 @@ final class CameraRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
         }
         session.addInput(newInput)
         input = newInput
-        if session.canAddOutput(output) { session.addOutput(output) }
+        if mode.includesMovie {
+            movieAttached = session.canAddOutput(output)
+            if movieAttached { session.addOutput(output) } else { log.event("camera output not attached: movie") }
+        }
+        var dataAttached = false
+        if mode.includesData {
+            dataOutput.setSampleBufferDelegate(frameProbe, queue: frameProbe.queue)
+            dataAttached = session.canAddOutput(dataOutput)
+            if dataAttached { session.addOutput(dataOutput) } else { log.event("camera output not attached: data") }
+        }
         session.commitConfiguration()
         session.startRunning()
-        log.event("camera started: \(device.localizedName) (\(device.uniqueID)) format \(device.activeFormat.formatDescription.dimensions)")
-        startNewFile()
+        if dataAttached {
+            frameProbe.start(synchronizationClock: session.synchronizationClock.map(UncheckedClock.init))
+        }
+        observe(device)
+        log.event("camera started: \(device.localizedName) (\(device.uniqueID)) format \(device.activeFormat.formatDescription.dimensions), output mode \(mode.rawValue), movie attached \(movieAttached), data attached \(dataAttached), synchronization clock \(session.synchronizationClock == nil ? "absent" : "present")")
+        if movieAttached { startNewFile() }
     }
 
     func switchTo(_ device: AVCaptureDevice) {
@@ -338,7 +555,45 @@ final class CameraRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
             log.event("camera switch failed: \(error.localizedDescription)")
         }
         session.commitConfiguration()
+        observe(device)
         log.event("camera switched to: \(device.localizedName) (\(device.uniqueID)) format \(device.activeFormat.formatDescription.dimensions)")
+        if movieAttached { startNewFile() }
+    }
+
+    /// Logs every change of whether another client holds the camera.
+    private func observe(_ device: AVCaptureDevice) {
+        deviceObservation = device.observe(\.isInUseByAnotherApplication, options: [.initial, .new]) {
+            [log] device, _ in
+            log.event("camera inUseByAnotherApplication=\(device.isInUseByAnotherApplication)")
+        }
+    }
+
+    /// Logs the camera's state at each effect start and stop. After a stop, a movie file that is
+    /// not recording is started again once the effect has had half a second to release the camera.
+    func effectChanged(started: Bool) {
+        log.event("camera state at effect \(started ? "start" : "stop"): session running \(session.isRunning), movie recording \(output.isRecording), inUseByAnotherApplication \(input?.device.isInUseByAnotherApplication ?? false)")
+        guard !started else { return }
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(500))
+            self.recoverMovie(after: "effect stop")
+        }
+    }
+
+    /// Starts a new movie file after an effect stop or an interruption end when none is recording,
+    /// at most three times; never while stopping, and while paused the file waits for resume.
+    private func recoverMovie(after cause: String) {
+        guard movieAttached, !isStopping, session.isRunning, !output.isRecording else { return }
+        guard recoveries < Self.maximumRecoveries else {
+            log.event("camera file not restarted after \(cause): recovery limit reached")
+            return
+        }
+        recoveries += 1
+        guard !isPaused else {
+            restartPendingResume = true
+            log.event("camera file due after \(cause) while paused; a new file starts on resume (recovery \(recoveries))")
+            return
+        }
+        log.event("camera file restarting after \(cause) (recovery \(recoveries))")
         startNewFile()
     }
 
@@ -362,9 +617,17 @@ final class CameraRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
         log.event("camera recording resumed")
     }
 
+    /// Refuses every later restart and recovery. Quit calls it before the streams stop, since
+    /// stopping them yields the main actor to effect callbacks and pending recoveries.
+    func beginStopping() {
+        isStopping = true
+    }
+
     func stop() {
+        beginStopping()
         stopRecordingIntentionally()
         session.stopRunning()
+        frameProbe.stop()
     }
 
     private func stopRecordingIntentionally() {
@@ -383,7 +646,7 @@ final class CameraRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
     /// switch or stop asking for it, is followed by a new file while the session runs, at most
     /// three times. While paused, the new file waits for resume.
     private func handleFinish(of url: URL, failed: Bool) {
-        guard intentionalStops.remove(url) == nil, failed, session.isRunning else { return }
+        guard intentionalStops.remove(url) == nil, failed, !isStopping, session.isRunning else { return }
         guard restartsAfterFailure < Self.maximumRestartsAfterFailure else {
             log.event("camera file stopped again; no further restart")
             return
@@ -397,7 +660,7 @@ final class CameraRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
         log.event("camera file stopped unexpectedly; starting a new file (restart \(restartsAfterFailure))")
         Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(500))
-            guard self.session.isRunning, !self.output.isRecording else { return }
+            guard !self.isStopping, self.session.isRunning, !self.output.isRecording else { return }
             guard !self.isPaused else {
                 self.restartPendingResume = true
                 self.log.event("paused during the restart delay; a new file starts on resume")
@@ -442,6 +705,7 @@ struct SpikeError: LocalizedError {
 @MainActor
 final class SpikeController: NSObject, NSApplicationDelegate {
     private let log: SpikeLog
+    private let cameraOutputMode: CameraOutputMode
     private var camera: CameraRecorder!
     private var displays: [SCDisplay] = []
     /// The captured display, kept by ID because the shareable-content order can change.
@@ -458,13 +722,14 @@ final class SpikeController: NSObject, NSApplicationDelegate {
     private let cameraPopup = NSPopUpButton()
     private let pauseButton = NSButton()
 
-    init(log: SpikeLog) {
+    init(log: SpikeLog, cameraOutputMode: CameraOutputMode) {
         self.log = log
+        self.cameraOutputMode = cameraOutputMode
         super.init()
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        camera = CameraRecorder(log: log)
+        camera = CameraRecorder(log: log, mode: cameraOutputMode)
         buildWindow()
         // The controller lives for the whole process, so the log may hold it.
         log.onEvent = { [controller = self] line in
@@ -595,6 +860,9 @@ final class SpikeController: NSObject, NSApplicationDelegate {
         var started: [(SCStream, StreamProbe)] = []
         for name in ["clean", "overlay"] {
             let probe = StreamProbe(name: name, generation: generation, log: log)
+            probe.onEffectChange = { [camera] started in
+                Task { @MainActor in camera?.effectChanged(started: started) }
+            }
             let configuration = configuration(named: name, for: display)
             let stream = SCStream(filter: filter, configuration: configuration, delegate: probe)
             do {
@@ -655,8 +923,10 @@ final class SpikeController: NSObject, NSApplicationDelegate {
                 log.event("resumed")
             } else {
                 paused = true
-                await stopStreams()
+                // The camera pauses before the streams stop, so no recovery starts a file while
+                // the stream shutdown yields the main actor.
                 camera.pause()
+                await stopStreams()
                 pauseButton.title = "Resume"
                 log.event("paused")
             }
@@ -695,6 +965,7 @@ final class SpikeController: NSObject, NSApplicationDelegate {
     }
 
     private func finish() async {
+        camera?.beginStopping()
         await stopStreams()
         camera?.stop()
         writeSummary()
@@ -716,7 +987,17 @@ final class SpikeController: NSObject, NSApplicationDelegate {
                 "effectStops": counts.effectStops,
             ])
         }
-        let summary: [String: Any] = ["streams": perStream]
+        let cameraTotals = camera.frameProbe.snapshot()
+        let summary: [String: Any] = [
+            "streams": perStream,
+            "camera": [
+                "outputMode": camera.mode.rawValue,
+                "movieFiles": camera.fileIndex,
+                "dataFrames": cameraTotals.frames,
+                "dataDrops": cameraTotals.drops,
+                "dataIntervalsWithoutFrames": cameraTotals.emptyIntervals,
+            ],
+        ]
         if let data = try? JSONSerialization.data(
             withJSONObject: summary, options: [.prettyPrinted, .sortedKeys])
         {
@@ -808,7 +1089,7 @@ final class SpikeController: NSObject, NSApplicationDelegate {
     private func updateStatus() {
         let display = selectedDisplayID ?? 0
         setStatus(
-            "\(paused ? "Paused" : "Capturing") · generation \(generation) · display \(display) · own windows \(excludeOwnWindows ? "excluded" : "included") · output \(log.directory.path)\nTurn Presenter Overlay on from the Video menu in the menu bar, and choose the \"overlay\" stream."
+            "\(paused ? "Paused" : "Capturing") · generation \(generation) · display \(display) · camera output \(cameraOutputMode.rawValue) · own windows \(excludeOwnWindows ? "excluded" : "included") · output \(log.directory.path)\nTurn Presenter Overlay on from the Video menu in the menu bar, and choose the \"overlay\" stream."
         )
     }
 
@@ -830,6 +1111,19 @@ final class SpikeController: NSObject, NSApplicationDelegate {
 
 // MARK: - Entry point
 
+/// The value after --camera-output, or movie+data when it is absent. An unknown value is
+/// reported and the process exits, so a run never records with a mode it was not asked for.
+func cameraOutputMode() -> CameraOutputMode {
+    let arguments = CommandLine.arguments
+    guard let index = arguments.firstIndex(of: "--camera-output") else { return .movieAndData }
+    guard arguments.indices.contains(index + 1), let mode = CameraOutputMode(rawValue: arguments[index + 1])
+    else {
+        FileHandle.standardError.write(Data("--camera-output takes movie+data, data, or movie\n".utf8))
+        exit(2)
+    }
+    return mode
+}
+
 func outputDirectory() -> URL {
     let arguments = CommandLine.arguments
     if let index = arguments.firstIndex(of: "--output"), arguments.indices.contains(index + 1) {
@@ -842,6 +1136,7 @@ func outputDirectory() -> URL {
         .appendingPathComponent(formatter.string(from: Date()), isDirectory: true)
 }
 
+let spikeCameraOutputMode = cameraOutputMode()
 let spikeLog: SpikeLog
 do {
     spikeLog = try SpikeLog(directory: outputDirectory())
@@ -853,7 +1148,7 @@ do {
 MainActor.assumeIsolated {
     let application = NSApplication.shared
     application.setActivationPolicy(.regular)
-    let controller = SpikeController(log: spikeLog)
+    let controller = SpikeController(log: spikeLog, cameraOutputMode: spikeCameraOutputMode)
     application.delegate = controller
     withExtendedLifetime(controller) {
         application.run()
