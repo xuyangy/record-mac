@@ -1,6 +1,6 @@
 # Verification record: encoder selection
 
-**Task or change**: T037
+**Task or change**: T037, T038
 
 **Date**: 2026-10-29
 
@@ -22,7 +22,7 @@ is not wired into any capture or export path.
 
 ## What was recorded
 
-Nothing was written to disk. Each probe sets the expected frame rate and real-time encoding on a
+Nothing was written to disk. Each probe hints the expected frame rate and real-time encoding on a
 `VTCompressionSession`, encodes three synthetic frames, and discards the output. The evidence
 covers those settings only; no profile, bit rate, or quality was set.
 
@@ -39,7 +39,8 @@ covers those settings only; no profile, bit rate, or quality was set.
    read of the hardware flag or the encoder ID is a failure, except that an encoder not
    supporting the hardware flag (`kVTPropertyNotSupportedErr`) is not using hardware, the
    default `VTCompressionProperties.h` documents; a setting the session rejects is a failure
-   naming the key and status; a zero, negative, or over-32-bit size or rate fails before
+   naming the key and status, except a hint (expected frame rate, real-time) that the encoder
+   does not support (`kVTPropertyNotSupportedErr`); a zero, negative, or over-32-bit size or rate fails before
    VideoToolbox is called.
 3. Real VideoToolbox, hardware path: every codec at 1920x1080, 60 fps, BGRA source, run only
    when `hw.model` is `Mac17,8` and skipped elsewhere. Pass rule: each selects hardware, with no
@@ -66,11 +67,12 @@ The full suite (`swift test`) and `scripts/check-no-network.sh` also ran.
 The software H.264 session answers the hardware-flag read with `kVTPropertyNotSupportedErr`
 (-12900) rather than false.
 
-All 14 tests passed. The full suite ran 888 tests, 6 skipped, none failed. The network check
+All 15 tests passed. The full suite ran 894 tests, 6 skipped, none failed. The network check
 passed.
 
-Not exercised: the software path for HEVC, HEVC with alpha, and ProRes, and decoding any encoded
-output (T038); capture sizes such as the built-in display's 2624x1696 or 120 and 240 fps; the
+The software path for every codec, with its output decoded, is in `encoder-fallback.md`.
+
+Not exercised: capture sizes such as the built-in display's 2624x1696 or 120 and 240 fps; the
 selector inside a capture or export writer.
 
 ## Outcome

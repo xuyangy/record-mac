@@ -115,7 +115,7 @@ struct EncoderSelector: Sendable {
 /// Probes with a VTCompressionSession: hardware required through
 /// `RequireHardwareAcceleratedVideoEncoder`, or hardware disabled through
 /// `EnableHardwareAcceleratedVideoEncoder = false`, with the expected frame rate and real-time
-/// encoding set. A probe succeeds only when the session accepts every setting, every submitted
+/// encoding hinted. A probe succeeds only when the session accepts every setting, every submitted
 /// frame comes back encoded, and the session reports which encoder ran and whether it was
 /// hardware. The evidence covers these settings only; a writer that sets a profile, bit rate, or
 /// other compression property needs a probe with the same settings.
@@ -141,15 +141,24 @@ struct VideoToolboxEncoderProbe: EncoderProbe {
         return nil
     }
 
+    /// A compression property the probe sets. A hint only tunes how the encoder runs, so an
+    /// encoder that does not support it (`kVTPropertyNotSupportedErr`) still encodes the format.
+    struct Setting {
+        let key: CFString
+        let value: CFTypeRef
+        let isHint: Bool
+    }
+
     /// Applies each setting in order; the first one the session rejects is a failure naming its
     /// key and status, since an encode with that setting ignored would not test the format asked
-    /// for.
+    /// for. The one exception is a hint the encoder does not support.
     static func apply(
-        _ settings: [(key: CFString, value: CFTypeRef)], using set: (CFString, CFTypeRef) -> OSStatus
+        _ settings: [Setting], using set: (CFString, CFTypeRef) -> OSStatus
     ) -> EncoderProbeOutcome? {
         for setting in settings {
             let status = set(setting.key, setting.value)
-            if status != noErr { return .failed("setting \(setting.key) rejected (\(status))") }
+            if status == noErr || (setting.isHint && status == kVTPropertyNotSupportedErr) { continue }
+            return .failed("setting \(setting.key) rejected (\(status))")
         }
         return nil
     }
@@ -184,6 +193,27 @@ struct VideoToolboxEncoderProbe: EncoderProbe {
     }
 
     func encode(_ format: EncoderFormat, on path: EncoderPath) -> EncoderProbeOutcome {
+        run(format, on: path, keepingSamples: false).outcome
+    }
+
+    /// Encodes as `encode(_:on:)` does and also returns the encoded samples in output order, so
+    /// the media the session produced can be decoded and tied to the encoder it reported.
+    func encodeKeepingSamples(
+        _ format: EncoderFormat, on path: EncoderPath
+    ) -> (outcome: EncoderProbeOutcome, samples: [CMSampleBuffer]) {
+        run(format, on: path, keepingSamples: true)
+    }
+
+    private func run(
+        _ format: EncoderFormat, on path: EncoderPath, keepingSamples: Bool
+    ) -> (outcome: EncoderProbeOutcome, samples: [CMSampleBuffer]) {
+        let tally = EncodeTally(keepsSamples: keepingSamples)
+        return (session(format, on: path, tally: tally), tally.snapshot().samples)
+    }
+
+    private func session(
+        _ format: EncoderFormat, on path: EncoderPath, tally: EncodeTally
+    ) -> EncoderProbeOutcome {
         if let reason = Self.invalidFormatReason(format) { return .failed(reason) }
         let specification: [CFString: Any] =
             switch path {
@@ -209,9 +239,9 @@ struct VideoToolboxEncoderProbe: EncoderProbe {
         }
         defer { VTCompressionSessionInvalidate(session) }
 
-        let settings: [(key: CFString, value: CFTypeRef)] = [
-            (kVTCompressionPropertyKey_ExpectedFrameRate, format.frameRate as CFNumber),
-            (kVTCompressionPropertyKey_RealTime, kCFBooleanTrue),
+        let settings = [
+            Setting(key: kVTCompressionPropertyKey_ExpectedFrameRate, value: format.frameRate as CFNumber, isHint: true),
+            Setting(key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue, isHint: true),
         ]
         if let rejected = Self.apply(settings, using: { key, value in
             VTSessionSetProperty(session, key: key, value: value)
@@ -226,7 +256,6 @@ struct VideoToolboxEncoderProbe: EncoderProbe {
         guard let pool = VTCompressionSessionGetPixelBufferPool(session) else {
             return .failed("compression session has no pixel buffer pool")
         }
-        let tally = EncodeTally()
         let frameDuration = CMTime(value: 1, timescale: CMTimeScale(format.frameRate))
         for index in 0..<frameCount {
             var pixelBuffer: CVPixelBuffer?
@@ -240,7 +269,7 @@ struct VideoToolboxEncoderProbe: EncoderProbe {
                 presentationTimeStamp: CMTimeMultiply(frameDuration, multiplier: Int32(index)),
                 duration: frameDuration, frameProperties: nil, infoFlagsOut: nil
             ) { status, _, sampleBuffer in
-                tally.record(status: status, encoded: sampleBuffer != nil)
+                tally.record(status: status, sampleBuffer: sampleBuffer)
             }
             guard encodeStatus == noErr else {
                 return .failed("encode of frame \(index) failed (\(encodeStatus))")
@@ -287,23 +316,31 @@ struct VideoToolboxEncoderProbe: EncoderProbe {
     }
 }
 
-/// Collects the encoder's per-frame results, which arrive on VideoToolbox's own thread.
+/// Collects the encoder's per-frame results, which arrive on VideoToolbox's own thread, and the
+/// encoded samples when asked to keep them.
 private final class EncodeTally: @unchecked Sendable {
     struct Result {
         var encoded = 0
         var firstFailure: OSStatus?
+        var samples: [CMSampleBuffer] = []
     }
 
+    private let keepsSamples: Bool
     private let lock = NSLock()
     private var result = Result()
 
-    func record(status: OSStatus, encoded: Bool) {
+    init(keepsSamples: Bool) {
+        self.keepsSamples = keepsSamples
+    }
+
+    func record(status: OSStatus, sampleBuffer: CMSampleBuffer?) {
         lock.lock()
         defer { lock.unlock() }
         if status != noErr {
             if result.firstFailure == nil { result.firstFailure = status }
-        } else if encoded {
+        } else if let sampleBuffer {
             result.encoded += 1
+            if keepsSamples { result.samples.append(sampleBuffer) }
         }
     }
 

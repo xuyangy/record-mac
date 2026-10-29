@@ -126,24 +126,38 @@ final class EncoderSelectionTests: XCTestCase {
         }
     }
 
+    private typealias Setting = VideoToolboxEncoderProbe.Setting
+
     func testARejectedSettingIsAFailureNamingItsKey() {
         var applied: [CFString] = []
         let outcome = VideoToolboxEncoderProbe.apply(
-            [(kVTCompressionPropertyKey_ExpectedFrameRate, 60 as CFNumber),
-             (kVTCompressionPropertyKey_RealTime, kCFBooleanTrue)]
+            [Setting(key: kVTCompressionPropertyKey_ExpectedFrameRate, value: 60 as CFNumber, isHint: true),
+             Setting(key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue, isHint: true)]
         ) { key, _ in
             applied.append(key)
-            return key == kVTCompressionPropertyKey_RealTime ? -12900 : noErr
+            return key == kVTCompressionPropertyKey_RealTime ? kVTParameterErr : noErr
         }
         guard case .failed(let reason) = outcome else { return XCTFail("rejection accepted") }
         XCTAssertTrue(reason.contains(kVTCompressionPropertyKey_RealTime as String), reason)
-        XCTAssertTrue(reason.contains("-12900"), reason)
+        XCTAssertTrue(reason.contains("\(kVTParameterErr)"), reason)
         XCTAssertEqual(applied.count, 2)
+    }
+
+    func testAnUnsupportedHintIsNotAFailureButAnUnsupportedRequirementIs() {
+        let unsupported: (CFString, CFTypeRef) -> OSStatus = { _, _ in kVTPropertyNotSupportedErr }
+        XCTAssertNil(VideoToolboxEncoderProbe.apply(
+            [Setting(key: kVTCompressionPropertyKey_ExpectedFrameRate, value: 60 as CFNumber, isHint: true)],
+            using: unsupported))
+        guard case .failed(let reason) = VideoToolboxEncoderProbe.apply(
+            [Setting(key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_High_AutoLevel, isHint: false)],
+            using: unsupported)
+        else { return XCTFail("unsupported requirement accepted") }
+        XCTAssertTrue(reason.contains("\(kVTPropertyNotSupportedErr)"), reason)
     }
 
     func testAcceptedSettingsAreNotAFailure() {
         XCTAssertNil(VideoToolboxEncoderProbe.apply(
-            [(kVTCompressionPropertyKey_RealTime, kCFBooleanTrue)]) { _, _ in noErr })
+            [Setting(key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue, isHint: false)]) { _, _ in noErr })
     }
 
     func testFormatsVideoToolboxCannotTakeFailWithoutReachingIt() {
