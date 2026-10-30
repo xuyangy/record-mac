@@ -59,7 +59,12 @@ struct CaptureStreamRouterReport: Equatable, Sendable {
 final class CaptureStreamRouter: NSObject, SCStreamOutput, @unchecked Sendable {
     let queue: DispatchQueue
 
-    private let retimer: SessionRetimer?
+    private let clock: CaptureClock
+    private let syncClock: () -> CMClock?
+    /// Built from the sync clock when the first buffer arrives, since a stream may have no clock
+    /// before it starts.
+    private var retimer: SessionRetimer?
+    private var retimerResolved = false
     private let missingClockReason = "the stream has no synchronization clock"
     private let screen: ScreenSegmentWriter?
     private let audio: AudioSourceWriters
@@ -67,10 +72,14 @@ final class CaptureStreamRouter: NSObject, SCStreamOutput, @unchecked Sendable {
     private var report = CaptureStreamRouterReport()
     private var closed = false
 
-    /// `syncClock` is the stream's synchronization clock; without one, every buffer is refused
-    /// with that reason.
-    init(clock: CaptureClock, syncClock: CMClock?, screen: ScreenSegmentWriter?, audio: AudioSourceWriters, queue: DispatchQueue) {
-        retimer = syncClock.map { SessionRetimer(clock: clock, syncClock: $0) }
+    /// `syncClock` gives the stream's synchronization clock, read once, on the queue, when the
+    /// first buffer arrives; without one, every buffer is refused with that reason.
+    init(
+        clock: CaptureClock, syncClock: @escaping () -> CMClock?, screen: ScreenSegmentWriter?,
+        audio: AudioSourceWriters, queue: DispatchQueue
+    ) {
+        self.clock = clock
+        self.syncClock = syncClock
         self.screen = screen
         self.audio = audio
         self.queue = queue
@@ -86,6 +95,10 @@ final class CaptureStreamRouter: NSObject, SCStreamOutput, @unchecked Sendable {
         guard !closed else {
             report.afterClose += 1
             return
+        }
+        if !retimerResolved {
+            retimerResolved = true
+            retimer = syncClock().map { SessionRetimer(clock: clock, syncClock: $0) }
         }
         switch type {
         case .screen: routeScreen(buffer)

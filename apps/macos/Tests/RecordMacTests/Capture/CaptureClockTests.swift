@@ -73,6 +73,32 @@ final class CaptureClockTests: XCTestCase {
         XCTAssertEqual(viaClock.seconds, 1.25, accuracy: 1e-6)
     }
 
+    func testAnEndedSessionHasNoTimeFromTheEndOnAndRefusesPauses() throws {
+        let clock = CaptureClock(epochHostTime: t(100))
+        XCTAssertTrue(clock.pause(atHostTime: t(101)))
+        XCTAssertTrue(clock.resume(atHostTime: t(102)))
+        XCTAssertTrue(clock.end(atHostTime: t(105)))
+        XCTAssertFalse(clock.end(atHostTime: t(106)))
+        XCTAssertFalse(clock.pause(atHostTime: t(106)))
+
+        XCTAssertEqual(try XCTUnwrap(clock.sessionTime(forHostTime: t(104.999))).seconds, 3.999, accuracy: 1e-9)
+        XCTAssertNil(clock.sessionTime(forHostTime: t(105)))
+        XCTAssertNil(clock.sessionTime(forHostTime: t(110)))
+        let snapshot = clock.snapshot()
+        XCTAssertEqual(try XCTUnwrap(snapshot.sessionTime(endingAt: t(110))).seconds, 4, accuracy: 1e-9, "a later stop ends at the end")
+        XCTAssertEqual(snapshot.spans, [.init(start: t(100), end: t(101)), .init(start: t(102), end: t(105))])
+    }
+
+    func testEndingWhilePausedKeepsThePauseAsTheEnd() throws {
+        let clock = CaptureClock(epochHostTime: t(100))
+        XCTAssertTrue(clock.pause(atHostTime: t(103)))
+        XCTAssertTrue(clock.end(atHostTime: t(109)))
+        XCTAssertFalse(clock.resume(atHostTime: t(110)))
+        let snapshot = clock.snapshot()
+        XCTAssertEqual(try XCTUnwrap(snapshot.sessionTime(endingAt: t(109))).seconds, 3, accuracy: 1e-9)
+        XCTAssertEqual(snapshot.spans, [.init(start: t(100), end: t(103))])
+    }
+
     func testReferenceRecordsTheEpochInNanoseconds() {
         XCTAssertEqual(CaptureClock(epochHostTime: t(2.5)).reference.epochHostTimeNanoseconds, 2_500_000_000)
     }

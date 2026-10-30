@@ -176,6 +176,20 @@ Each file is listed here, with its changes, by the task that adapts it.
   `isReadyForMoreMediaData` shed, which `ScreenFrameCounter` counts instead. Presenter Overlay
   metadata never stops a complete frame. Frames, samples, and failures before the writers are
   counted in a `CaptureStreamRouterReport`; `close` ends admission on the sample queue.
+- The stream setup and stop in `QuickRecorder/RecordEngine.swift`'s `record(filter:fastStart:)`
+  (lines 259-296) and `stream(_:didStopWithError:)` (lines 624-631) →
+  `apps/macos/Sources/RecordMac/Capture/ScreenCaptureBackend.swift` (T029), the
+  `CaptureBackend` behind `CaptureEngine`. One `SCStream` adds the screen, system audio, and
+  microphone outputs as selected, all on one serial sample queue; upstream used the global
+  queue and added audio always. The encoder is chosen per screen segment format by
+  `EncoderSelector`, with HEVC, instead of upstream's H.264 hardware probe and its alert. A
+  stream that stops on its own keeps its reason and time, and the recording ends there with
+  what was captured; upstream stopped the recording from the main queue. `stop` ends the session
+  clock before it stops the stream, so nothing stamped after the stop is written. Source lookup,
+  filters, and native pixel sizes come from `ScreenCaptureSourceResolver`,
+  `CaptureSourceLocator`, and `CaptureSourceGeometry`, which refuse a size that is not whole
+  pixels instead of rounding it. Not carried: the output folder alert, the global mouse
+  monitor, `initVideo`, and the separate microphone recording.
 - `QuickRecorder/SCContext.swift` is not carried. Its stream, writer, and timing state belong
   with the stream callbacks; its permission alerts, `AppDelegate` calls, previews, trimming, MP3
   export, `mixAudioTracks`, and `AECAudioStream` engine are not used.

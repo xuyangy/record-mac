@@ -50,7 +50,7 @@ final class CaptureStreamRouterTests: XCTestCase {
     }
 
     private func router(_ audio: AudioSourceWriters, syncClock: CMClock? = CaptureClock.hostClock) -> CaptureStreamRouter {
-        CaptureStreamRouter(clock: clock, syncClock: syncClock, screen: screen, audio: audio, queue: queue)
+        CaptureStreamRouter(clock: clock, syncClock: { syncClock }, screen: screen, audio: audio, queue: queue)
     }
 
     /// As ScreenCaptureKit calls the output: on the sample queue, in order.

@@ -7,13 +7,15 @@ import Foundation
 /// A buffer's time comes only from its own presentation timestamp, converted to the host clock
 /// from the clock that produced it. Callback arrival time is never used. Session time starts at
 /// zero at the epoch and stops while paused, so a paused stretch appears in no track; a buffer
-/// stamped inside a pause has no session time and is not written.
+/// stamped inside a pause has no session time and is not written. Once the session ends, a
+/// buffer stamped at or after the end has none either.
 final class CaptureClock: @unchecked Sendable {
     typealias Pause = CaptureClockSnapshot.Pause
 
     let epochHostTime: CMTime
     private let lock = NSLock()
     private var pauseIntervals: [Pause] = []
+    private var endHostTime: CMTime?
 
     static var hostClock: CMClock { CMClockGetHostTimeClock() }
 
@@ -38,7 +40,7 @@ final class CaptureClock: @unchecked Sendable {
     func pause(atHostTime hostTime: CMTime) -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        guard hostTime.isNumeric, hostTime >= epochHostTime else { return false }
+        guard endHostTime == nil, hostTime.isNumeric, hostTime >= epochHostTime else { return false }
         if let last = pauseIntervals.last {
             guard let end = last.endHostTime, hostTime >= end else { return false }
         }
@@ -52,7 +54,7 @@ final class CaptureClock: @unchecked Sendable {
     func resume(atHostTime hostTime: CMTime) -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        guard hostTime.isNumeric, var last = pauseIntervals.last, last.endHostTime == nil,
+        guard endHostTime == nil, hostTime.isNumeric, var last = pauseIntervals.last, last.endHostTime == nil,
             hostTime >= last.startHostTime
         else { return false }
         last.endHostTime = hostTime
@@ -60,12 +62,25 @@ final class CaptureClock: @unchecked Sendable {
         return true
     }
 
-    /// The epoch and every pause as they stand now, so one buffer is mapped against one state
-    /// even while a pause or resume lands.
+    /// Ends session time at `hostTime`, so nothing stamped at or after it is written, while
+    /// buffers stamped before it still are. An open pause stays open: the session already ended
+    /// where it began. Returns false, changing nothing, if already ended or if `hostTime`
+    /// precedes the epoch.
+    @discardableResult
+    func end(atHostTime hostTime: CMTime) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard endHostTime == nil, hostTime.isNumeric, hostTime >= epochHostTime else { return false }
+        endHostTime = hostTime
+        return true
+    }
+
+    /// The epoch, every pause, and the end as they stand now, so one buffer is mapped against
+    /// one state even while a pause, resume, or end lands.
     func snapshot() -> CaptureClockSnapshot {
         lock.lock()
         defer { lock.unlock() }
-        return CaptureClockSnapshot(epochHostTime: epochHostTime, pauses: pauseIntervals)
+        return CaptureClockSnapshot(epochHostTime: epochHostTime, pauses: pauseIntervals, endHostTime: endHostTime)
     }
 
     /// Session time for a host-clock timestamp, or nil if it precedes the epoch or falls inside a
@@ -122,11 +137,14 @@ struct CaptureClockSnapshot: Sendable {
 
     let epochHostTime: CMTime
     let pauses: [Pause]
+    /// Nil until the session ends.
+    var endHostTime: CMTime?
 
-    /// Session time for a host-clock timestamp, or nil if it precedes the epoch or falls inside a
-    /// pause.
+    /// Session time for a host-clock timestamp, or nil if it precedes the epoch, falls inside a
+    /// pause, or is at or after the end.
     func sessionTime(forHostTime hostTime: CMTime) -> CMTime? {
         guard hostTime.isNumeric, hostTime >= epochHostTime else { return nil }
+        if let endHostTime, hostTime >= endHostTime { return nil }
         var paused = CMTime.zero
         for pause in pauses {
             guard hostTime >= pause.startHostTime else { break }
@@ -136,18 +154,43 @@ struct CaptureClockSnapshot: Sendable {
         return hostTime - epochHostTime - paused
     }
 
-    /// The host time that has session time, in order: from the epoch, less every pause. Empty
-    /// pauses leave no gap.
+    /// Session time at `hostTime`, taken no later than the end, or where the pause began when it
+    /// falls inside one, so a recording stopped while paused ends at its pause; nil before the
+    /// epoch.
+    func sessionTime(endingAt requested: CMTime) -> CMTime? {
+        guard requested.isNumeric, requested >= epochHostTime else { return nil }
+        let hostTime = endHostTime.map { min($0, requested) } ?? requested
+        var paused = CMTime.zero
+        for pause in pauses {
+            guard hostTime >= pause.startHostTime else { break }
+            guard let end = pause.endHostTime, hostTime >= end else {
+                return pause.startHostTime - epochHostTime - paused
+            }
+            paused = paused + (end - pause.startHostTime)
+        }
+        return hostTime - epochHostTime - paused
+    }
+
+    /// The host time that has session time, in order: from the epoch to the end, less every
+    /// pause. Empty pauses leave no gap.
     var spans: [Span] {
         var spans: [Span] = []
         var start = epochHostTime
         for pause in pauses {
             if let end = pause.endHostTime, end <= pause.startHostTime { continue }
             if pause.startHostTime > start { spans.append(Span(start: start, end: pause.startHostTime)) }
-            guard let end = pause.endHostTime else { return spans }
+            guard let end = pause.endHostTime else { return clipped(spans) }
             start = max(start, end)
         }
         spans.append(Span(start: start, end: nil))
-        return spans
+        return clipped(spans)
+    }
+
+    private func clipped(_ spans: [Span]) -> [Span] {
+        guard let endHostTime else { return spans }
+        return spans.compactMap { span in
+            guard span.start < endHostTime else { return nil }
+            return Span(start: span.start, end: span.end.map { min($0, endHostTime) } ?? endHostTime)
+        }
     }
 }
