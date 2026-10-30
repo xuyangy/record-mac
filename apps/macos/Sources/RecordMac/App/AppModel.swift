@@ -243,7 +243,7 @@ final class AppModel: ObservableObject {
     private let countdownOverlayController: RecordingCountdownOverlayController
     private let captureUIHideDelayNanoseconds: UInt64
 
-    let service: RustServiceClient
+    let library: LegacyProjectLibraryStore
     let capture: CaptureController
     let appShell = AppShellDriver()
     let capabilityBanner = CapabilityBannerModel()
@@ -308,12 +308,12 @@ final class AppModel: ObservableObject {
         loadBackendSnapshot: (@Sendable () async throws -> BackendSnapshot)? = nil,
         registerImportedMedia: (@Sendable (EditorMediaKind, String, Data) throws -> ProjectSummary)? = nil,
         registerCapturedMedia: (@Sendable (String, Data) throws -> ProjectSummary)? = nil,
-        prepareRecordingFilePath: (@Sendable (String) throws -> PreparedFile)? = nil
+        prepareRecordingFilePath: (@Sendable (String) throws -> PreparedFile)? = nil,
+        library: LegacyProjectLibraryStore = .standard()
     ) {
-        let service = RustServiceClient()
         let capture = CaptureController(screenRecordingPermission: screenRecordingPermission)
         let preferences = recordingPreferences.load()
-        self.service = service
+        self.library = library
         self.screenRecordingPermission = screenRecordingPermission
         self.accessibilityPermission = accessibilityPermission
         self.onboardingStore = onboardingStore
@@ -347,42 +347,24 @@ final class AppModel: ObservableObject {
         self.stopFacecamRecording = stopFacecamRecording
         self.cancelFacecamRecording = cancelFacecamRecording
         self.rememberScreenshot = rememberScreenshot ?? { outputURL in
-            let _: PreparedFile = try service.call(
-                "rememberScreenshot",
-                params: ["path": outputURL.path],
-                as: PreparedFile.self
-            )
+            try library.rememberScreenshot(path: outputURL.path)
         }
         self.trashProjectFile = trashProjectFile ?? { projectURL in
             var trashedURL: NSURL?
             try FileManager.default.trashItem(at: projectURL, resultingItemURL: &trashedURL)
         }
         self.forgetProject = forgetProject ?? { path in
-            let _: ForgetProjectResult = try service.call(
-                "forgetProject",
-                params: ["path": path],
-                as: ForgetProjectResult.self
-            )
+            try library.forgetProject(path: path)
         }
         self.loadBackendSnapshot = loadBackendSnapshot ?? {
-            async let health: HealthPayload = Task.detached(priority: .userInitiated) {
-                try service.call("health", as: HealthPayload.self)
+            try await Task.detached(priority: .userInitiated) {
+                let paths = try library.paths()
+                return BackendSnapshot(health: .native, paths: paths, projects: try library.listProjects())
             }.value
-            async let paths: AppPaths = Task.detached(priority: .userInitiated) {
-                try service.call("paths", as: AppPaths.self)
-            }.value
-            async let projects: [ProjectSummary] = Task.detached(priority: .userInitiated) {
-                try service.call("listProjects", as: [ProjectSummary].self)
-            }.value
-            return try await BackendSnapshot(
-                health: health,
-                paths: paths,
-                projects: projects
-            )
         }
         self.registerImportedMedia = registerImportedMedia ?? { kind, path, editorStateData in
             let title = URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
-            if let projects = try? service.call("listProjects", as: [ProjectSummary].self),
+            if let projects = try? library.listProjects(),
                let existing = projects.first(where: { project in
                    guard let mediaPath = project.mediaPath,
                          FileManager.default.fileExists(atPath: project.path) else {
@@ -393,41 +375,27 @@ final class AppModel: ObservableObject {
                }) {
                 return existing
             }
-            let editorState = (try? JSONSerialization.jsonObject(with: editorStateData)) ?? [:]
+            let editorState = (try? JSONSerialization.jsonObject(with: editorStateData)) != nil
+                ? editorStateData : Data("{}".utf8)
             switch kind {
             case .video:
-                return try service.call(
-                    "registerRecording",
-                    params: [
-                        "path": path,
-                        "sourceName": "Imported Recording",
-                        "title": title,
-                        "editorState": editorState
-                    ],
-                    as: ProjectSummary.self
-                )
+                return try library.registerRecording(LegacyProjectRequest(
+                    path: path, title: title, sourceName: "Imported Recording", editorState: editorState))
             case .screenshot:
-                return try service.call(
-                    "registerScreenshot",
-                    params: [
-                        "path": path,
-                        "sourceName": "Imported Screenshot",
-                        "title": title,
-                        "editorState": editorState
-                    ],
-                    as: ProjectSummary.self
-                )
+                return try library.registerScreenshot(LegacyProjectRequest(
+                    path: path, title: title, sourceName: "Imported Screenshot", editorState: editorState))
             }
         }
         self.registerCapturedMedia = registerCapturedMedia ?? { method, paramsData in
-            try service.call(method, paramsData: paramsData, as: ProjectSummary.self)
+            let request = try LegacyProjectRequest(params: paramsData)
+            switch method {
+            case "registerRecording": return try library.registerRecording(request)
+            case "registerScreenshot": return try library.registerScreenshot(request)
+            default: throw LegacyLibraryError.missingParameter("unknown registration \(method)")
+            }
         }
         self.prepareRecordingFilePath = prepareRecordingFilePath ?? { fileName in
-            try service.call(
-                "prepareRecordingFile",
-                params: ["fileName": fileName],
-                as: PreparedFile.self
-            )
+            try library.prepareRecordingFile(fileName: fileName)
         }
         self.runRecordingCountdown = runRecordingCountdown ?? { [countdownOverlayController] source in
             try await countdownOverlayController.run(for: source)
@@ -1965,9 +1933,9 @@ final class AppModel: ObservableObject {
     }
 
     private func loadAppPaths() async throws -> AppPaths {
-        let service = service
+        let library = library
         return try await Task.detached(priority: .utility) {
-            try service.call("paths", as: AppPaths.self)
+            try library.paths()
         }.value
     }
 
@@ -2052,21 +2020,8 @@ final class AppModel: ObservableObject {
         registrationError: Error
     ) async -> CapturedProjectRegistrationOutcome {
         let now = ISO8601DateFormatter().string(from: Date())
-        let projectsDirectory: URL
-        if let paths {
-            projectsDirectory = URL(fileURLWithPath: paths.projectsDir, isDirectory: true)
-        } else if let applicationSupport = FileManager.default.urls(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask
-        ).first {
-            projectsDirectory = applicationSupport
-                .appendingPathComponent(AppVariant.storageDirectoryName, isDirectory: true)
-                .appendingPathComponent("Projects", isDirectory: true)
-        } else if let mediaURL = screenshotURL ?? recordingURL {
-            projectsDirectory = mediaURL.deletingLastPathComponent()
-        } else {
-            return .failed(registrationError.localizedDescription)
-        }
+        let projectsDirectory = paths.map { URL(fileURLWithPath: $0.projectsDir, isDirectory: true) }
+            ?? library.locations.projects
         let newProjectURL = projectsDirectory
             .appendingPathComponent("recovered-\(UUID().uuidString.lowercased())")
             .appendingPathExtension("openrecorder")
@@ -2468,9 +2423,9 @@ final class AppModel: ObservableObject {
 
     func autosaveProject(_ snapshot: ProjectAutosaveSnapshot) async throws -> ProjectSummary {
         let paramsData = try JSONEncoder().encode(ProjectUpdateRequest(snapshot: snapshot))
-        let service = service
+        let library = library
         return try await Task.detached(priority: .utility) {
-            try service.call("updateProject", paramsData: paramsData, as: ProjectSummary.self)
+            try library.updateProject(LegacyProjectRequest(params: paramsData))
         }.value
     }
 

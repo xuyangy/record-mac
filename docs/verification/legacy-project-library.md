@@ -1,6 +1,6 @@
-# Verification record: native legacy project library, part 1
+# Verification record: native legacy project library
 
-**Task or change**: T056 (part 1; T056 stays open)
+**Task or change**: T056
 
 **Date**: 2026-10-30
 
@@ -20,7 +20,7 @@ Debug build, Xcode toolchain (`DEVELOPER_DIR=/Applications/Xcode.app/Contents/De
 Each test uses its own temporary folders; the Rust service is neither built nor run. Behaviour is
 compared with open-recorder's `apps/rust-service/src/main.rs` and its tests at `afa3176`.
 
-## What part 1 covers
+## What is covered
 
 - `LegacyProjectLibraryStore` handles the project library requests the app sends today:
   `paths`, `prepareRecordingFile`, `registerRecording`, `registerScreenshot`, `saveProject`,
@@ -30,15 +30,20 @@ compared with open-recorder's `apps/rust-service/src/main.rs` and its tests at `
   the production and nightly libraries are separate.
 - `LegacyProjectRequest` reads a request's JSON parameters. String fields count only when they
   are strings. `editorState` and `recordingSession` are kept as the caller's JSON.
-
-## Not covered by part 1
-
-- Switching `AppModel`'s callers to the store, a native `health` payload, and removing
-  `RustServiceClient.swift` and `RustServiceClientTests.swift` (part 2).
+- `AppModel` takes a `LegacyProjectLibraryStore` (default `.standard()`) and uses it for
+  refresh, paths, recording-file preparation, captured and imported media registration,
+  autosave, forgetting a project, and remembering a screenshot. Disk work stays off the main
+  actor. When registration fails before the library's paths have loaded, the local recovery
+  project goes to the store's projects folder. Refresh reports `HealthPayload.native`, and the ready message is `Library ready`.
+- Inside a test process, `.standard()` gives each call a new temporary folder.
+- `RustServiceClient.swift` and its tests are removed. The tests of its pipe buffering and
+  process time-outs have no replacement, since no helper process remains.
 
 ## What was checked
 
-`swift test --filter LegacyProjectLibraryStoreTests` in `apps/macos`, 32 tests, three runs:
+`swift test --filter 'LegacyProjectLibraryStoreTests|AppModelNativeLibraryTests|AppVariantTests|AppPresentationStateMachineTests|ProjectLibraryAndSettingsViewStateTests|AppModelStateTests'`
+in `apps/macos`, 149 tests, three runs. Items 1 to 6 are `LegacyProjectLibraryStoreTests`
+(32 tests):
 
 1. Locations: production and nightly folders differ and use this app's names; `paths` creates
    the folders and an empty index; prepared recording files are sanitised into the recordings
@@ -74,9 +79,27 @@ compared with open-recorder's `apps/rust-service/src/main.rs` and its tests at `
    newest first by numeric time, with stable IDs, and skips entries without a path. It keeps
    the latest 100, with no duplicates.
 
+7. `AppModelNativeLibraryTests`, each with a library in its own temporary folder:
+   - Refresh loads the library's paths and projects, reports native health and `Library
+     ready`; a damaged library with no backup is reported as a failure.
+   - A screenshot taken through the model is registered as a project and remembered in the
+     recent list, with its editor state.
+   - Importing the same video twice, the second time from a new model with no loaded projects,
+     makes one project.
+   - An import whose registration fails, on a model whose paths have not loaded, writes its
+     recovery project and marker into the injected library, where listing finds it.
+   - Autosave updates the document's title and editor state and keeps its ID and creation time.
+   - In a test process, `.standard()` gives a new temporary folder on each call, not one under
+     the user's `Library`.
+8. `AppVariantTests`: only the nightly bundle identifier selects `RecordMacNightly`, and a
+   shell variable cannot change it. The settings and presentation tests expect `Library ready`.
+   The fallback tests in `AppModelStateTests` make registration fail on purpose, so they still
+   check the local recovery path.
+
 To check that the tests can fail, two faults were put in, one at a time, each for one run.
 With the document restore removed, both restore tests failed. With a failed update removing any
-marker, the marker test failed for both cases. Each fault was then removed.
+marker, the marker test failed for both cases. With the recovery project sent to another temporary folder,
+the failed-import test failed. Each fault was then removed.
 
 The full suite (`swift test`) and `scripts/check-no-network.sh` also ran.
 
@@ -85,10 +108,17 @@ The full suite (`swift test`) and `scripts/check-no-network.sh` also ran.
 On macOS, an immutable index file can be read, but renaming another file over it fails. This is
 how the tests make the index readable but impossible to replace.
 
-All 32 tests passed in each of three runs. The full suite ran 1046 tests, 6 skipped, none
-failed. The network check passed.
+All 149 tests passed in each of three runs. The network check passed.
+
+The full suite ran 1048 tests: 6 skipped and 1 failed. The failed test is
+`TargetResolverTests.testAControlledButtonResolvesThroughTheSystem`. It opens a real window and
+hit-tests its button on screen. The session was locked during the run
+(`CGSSessionScreenIsLocked` was true), so the button was not on screen. This change does not touch
+that test or the resolver. The full suite is therefore not a pass. A run in an unlocked session
+is still needed to close the live Accessibility check. After the runs, the user's library under
+`~/Library/Application Support/Record Mac/Projects` had no file changed.
 
 ## Outcome
 
-Pass for part 1. Part 2 is still to do: switching the callers and removing the Rust service
-client.
+Pass for the native library. The app's legacy project library runs natively, with no Rust
+service. The live Accessibility test in the full suite is open until an unlocked-session run.

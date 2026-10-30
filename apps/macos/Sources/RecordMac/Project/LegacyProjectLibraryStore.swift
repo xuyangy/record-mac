@@ -129,9 +129,16 @@ struct LegacyProjectLibraryStore: Sendable {
         self.locations = locations
     }
 
-    /// The library under the user's home folder, for this bundle's variant.
+    /// The library under the user's home folder, for this bundle's variant. Inside a test
+    /// process, each call gets a new temporary folder instead, so tests never touch the user's
+    /// library.
     static func standard() -> Self {
-        Self(locations: .forHome(FileManager.default.homeDirectoryForCurrentUser))
+        guard NSClassFromString("XCTestCase") != nil else {
+            return Self(locations: .forHome(FileManager.default.homeDirectoryForCurrentUser))
+        }
+        let home = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RecordMacTests-library-\(UUID().uuidString)", isDirectory: true)
+        return Self(locations: .forHome(home))
     }
 
     // MARK: Requests

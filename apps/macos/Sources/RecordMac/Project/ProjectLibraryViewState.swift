@@ -162,7 +162,7 @@ func settingsServicePresentationState(
     }
 
     let trimmedMessage = statusMessage.trimmingCharacters(in: .whitespacesAndNewlines)
-    if let availableValue, trimmedMessage.isEmpty || trimmedMessage == "Rust service ready" {
+    if let availableValue, trimmedMessage.isEmpty || trimmedMessage == HealthPayload.readyMessage {
         return .available(availableValue)
     }
     if trimmedMessage.isEmpty {

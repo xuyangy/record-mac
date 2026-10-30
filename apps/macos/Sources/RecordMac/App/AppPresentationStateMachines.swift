@@ -738,7 +738,7 @@ extension SettingsMachineState {
 
         case .serviceRefreshSucceeded:
             isRefreshingService = false
-            statusMessage = "Rust service ready"
+            statusMessage = HealthPayload.readyMessage
             return []
 
         case .serviceRefreshFailed(let message):

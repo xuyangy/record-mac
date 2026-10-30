@@ -415,7 +415,7 @@ struct CaptureHUD: View {
         let message = model.statusMessage.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !message.isEmpty,
               message != "Ready",
-              message != "Rust service ready",
+              message != HealthPayload.readyMessage,
               !message.hasPrefix("Selected "),
               !message.hasPrefix("Opened "),
               !message.hasPrefix("System audio "),

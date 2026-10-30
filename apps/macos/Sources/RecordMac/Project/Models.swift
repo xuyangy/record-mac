@@ -119,10 +119,6 @@ struct PreparedFile: Codable, Sendable {
     var path: String
 }
 
-struct ForgetProjectResult: Codable {
-    var removed: Bool
-}
-
 enum ProjectAvailability: String, Codable, CaseIterable, Sendable {
     case available
     case missingProject
@@ -999,6 +995,17 @@ struct HealthPayload: Codable, Sendable {
     var service: String
     var version: String
     var platform: String
+
+    /// The app's own project library, at the bundle's version.
+    static var native: HealthPayload {
+        HealthPayload(
+            service: "Record Mac library",
+            version: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "development",
+            platform: "macos")
+    }
+
+    /// The status message once the library has loaded.
+    static let readyMessage = "Library ready"
 }
 
 func timestampedFileName(prefix: String, extension fileExtension: String, date: Date = Date()) -> String {

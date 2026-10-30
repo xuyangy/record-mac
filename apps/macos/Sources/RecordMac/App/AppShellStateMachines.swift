@@ -119,7 +119,7 @@ extension AppShellState {
             self.projects = projects
             serviceHealth = health
             backendLoadPhase = .loaded
-            statusMessage = "Rust service ready"
+            statusMessage = HealthPayload.readyMessage
             return [.setStatusMessage(statusMessage)]
 
         case .backendRefreshFailed(let message):

@@ -7,13 +7,8 @@ enum AppVariant {
     static func isNightly(bundleIdentifier: String?) -> Bool {
         bundleIdentifier == nightlyBundleIdentifier
     }
-    static var storageDirectoryName: String { isNightly ? "RecordMacNightly" : "Record Mac" }
-    static func serviceEnvironment(
-        inherited: [String: String] = ProcessInfo.processInfo.environment,
-        bundleIdentifier: String? = Bundle.main.bundleIdentifier
-    ) -> [String: String] {
-        var environment = inherited
-        environment["OPEN_RECORDER_APP_VARIANT"] = isNightly(bundleIdentifier: bundleIdentifier) ? "nightly" : "production"
-        return environment
+    static var storageDirectoryName: String { storageDirectoryName(bundleIdentifier: Bundle.main.bundleIdentifier) }
+    static func storageDirectoryName(bundleIdentifier: String?) -> String {
+        isNightly(bundleIdentifier: bundleIdentifier) ? "RecordMacNightly" : "Record Mac"
     }
 }

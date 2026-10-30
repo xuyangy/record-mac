@@ -2,22 +2,17 @@ import XCTest
 @testable import RecordMac
 
 final class AppVariantTests: XCTestCase {
-    func testNightlyHelperEnvironmentCannotBeOverriddenByParent() {
-        let environment = AppVariant.serviceEnvironment(
-            inherited: ["HOME": "/test/home", "OPEN_RECORDER_APP_VARIANT": "production"],
-            bundleIdentifier: "dev.openrecorder.app.nightly"
-        )
-        XCTAssertEqual(environment["HOME"], "/test/home")
-        XCTAssertEqual(environment["OPEN_RECORDER_APP_VARIANT"], "nightly")
+    func testOnlyTheNightlyIdentifierSelectsTheNightlyLibrary() {
+        XCTAssertEqual(AppVariant.storageDirectoryName(bundleIdentifier: "dev.openrecorder.app.nightly"), "RecordMacNightly")
+        for identifier in ["dev.openrecorder.app", "dev.openrecorder.app.dev", "local.recordmac.app", nil] {
+            XCTAssertEqual(AppVariant.storageDirectoryName(bundleIdentifier: identifier), "Record Mac")
+        }
     }
 
-    func testProductionAndDevKeepExistingStorage() {
-        for identifier in ["dev.openrecorder.app", "dev.openrecorder.app.dev"] {
-            let environment = AppVariant.serviceEnvironment(
-                inherited: ["OPEN_RECORDER_APP_VARIANT": "nightly"], bundleIdentifier: identifier
-            )
-            XCTAssertEqual(environment["OPEN_RECORDER_APP_VARIANT"], "production")
-        }
+    func testShellVariablesCannotSelectTheLibrary() {
+        setenv("OPEN_RECORDER_APP_VARIANT", "nightly", 1)
+        defer { unsetenv("OPEN_RECORDER_APP_VARIANT") }
+        XCTAssertEqual(AppVariant.storageDirectoryName(bundleIdentifier: "local.recordmac.app"), "Record Mac")
     }
 
     func testNightlyShortcutDefaultsAreDisabledAndCanBeEnabled() {

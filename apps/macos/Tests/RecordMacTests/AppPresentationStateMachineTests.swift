@@ -58,8 +58,8 @@ final class AppShellStateMachineTests: XCTestCase {
         XCTAssertEqual(state.projects, [project])
         XCTAssertEqual(state.serviceHealth, health)
         XCTAssertEqual(state.backendLoadPhase, .loaded)
-        XCTAssertEqual(state.statusMessage, "Rust service ready")
-        XCTAssertEqual(effects, [.setStatusMessage("Rust service ready")])
+        XCTAssertEqual(state.statusMessage, HealthPayload.readyMessage)
+        XCTAssertEqual(effects, [.setStatusMessage(HealthPayload.readyMessage)])
     }
 
     func testShellBackendRefreshPublishesLoadingBeforeResultsArrive() {

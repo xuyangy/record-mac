@@ -177,7 +177,7 @@ final class SettingsViewPresentationStateTests: XCTestCase {
             settingsServicePresentationState(
                 health: health,
                 isRefreshing: false,
-                statusMessage: "Rust service ready"
+                statusMessage: HealthPayload.readyMessage
             ),
             .available("open-recorder 2.0")
         )
