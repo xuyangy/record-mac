@@ -3,7 +3,7 @@ import CoreMedia
 import Foundation
 
 /// A screen frame's ScreenCaptureKit status (`SCFrameStatus`).
-enum ScreenFrameStatus: Equatable, Sendable {
+enum ScreenFrameStatus: Hashable, Sendable {
     case complete
     case idle
     case blank

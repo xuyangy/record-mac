@@ -164,6 +164,18 @@ Each file is listed here, with its changes, by the task that adapts it.
   positions. A buffer that cannot be split is kept or left out whole, or refused with a reason
   when a boundary falls inside it. Durations and decode offsets are converted with the
   timestamps, and a timestamp the sync clock cannot convert is refused.
+- The routing in `QuickRecorder/RecordEngine.swift`'s `stream(_:didOutputSampleBuffer:of:)`
+  (lines 489-622) → `apps/macos/Sources/RecordMac/Capture/CaptureStreamRouter.swift` (T029).
+  The status read from `SCStreamFrameInfo.status` is kept. Each output type goes through
+  `SessionRetimer` to its own writer: screen frames to `ScreenSegmentWriter`, system audio and
+  microphone to their own `AudioSourceWriters` track; upstream wrote screen and system audio to
+  one `AVAssetWriter` and ignored `.microphone`. Not carried: the frame-grab-to-PNG/HEIF path,
+  the skip of frames at or before an earlier frame's end, the drop of frames while the
+  presenter camera is not ready (`if isPresenterON && !isCameraReady { break }`) and its timer,
+  the drop of audio before the first screen frame, the audio-only file path, and the
+  `isReadyForMoreMediaData` shed, which `ScreenFrameCounter` counts instead. Presenter Overlay
+  metadata never stops a complete frame. Frames, samples, and failures before the writers are
+  counted in a `CaptureStreamRouterReport`; `close` ends admission on the sample queue.
 - `QuickRecorder/SCContext.swift` is not carried. Its stream, writer, and timing state belong
   with the stream callbacks; its permission alerts, `AppDelegate` calls, previews, trimming, MP3
   export, `mixAudioTracks`, and `AECAudioStream` engine are not used.
