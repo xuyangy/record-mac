@@ -150,6 +150,20 @@ Each file is listed here, with its changes, by the task that adapts it.
   - Not carried: the HDR preset and PQ colour space, the background colour, the audio-only
     stream, the `fastStart` cursor override, the H.264 hardware-encoder probe, and the
     `SCContext.timeOffset` reset. Pause timing is `CaptureClock`'s.
+- The pause timing in `QuickRecorder/RecordEngine.swift`'s
+  `stream(_:didOutputSampleBuffer:of:)` (lines 544-577) and `SCContext.adjustTime(sample:by:)`
+  (`SCContext.swift` lines 685-700) is replaced by
+  `apps/macos/Sources/RecordMac/Capture/SessionRetimer.swift` (T029). Upstream started the
+  writer session at the first screen frame, measured each pause as the gap between the last
+  screen frame before it and the first buffer of any kind after it, and subtracted the summed
+  gaps from later buffers. Audio was dropped before the first screen frame, and whole buffers
+  were dropped when they arrived while paused. Here each buffer's own
+  timestamp, read on the stream's synchronization clock, is mapped through one `CaptureClock`
+  snapshot. Linear PCM is split at the epoch and at each pause start and end inside a packet,
+  so samples recorded during a pause are left out and the rest keep their values and session
+  positions. A buffer that cannot be split is kept or left out whole, or refused with a reason
+  when a boundary falls inside it. Durations and decode offsets are converted with the
+  timestamps, and a timestamp the sync clock cannot convert is refused.
 - `QuickRecorder/SCContext.swift` is not carried. Its stream, writer, and timing state belong
   with the stream callbacks; its permission alerts, `AppDelegate` calls, previews, trimming, MP3
   export, `mixAudioTracks`, and `AECAudioStream` engine are not used.
