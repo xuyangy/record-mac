@@ -129,7 +129,30 @@ to detect a nightly build.
 
 ### From QuickRecorder (`e820517`)
 
-Nothing yet. Each file is listed here, with its changes, by the task that adapts it.
+Each file is listed here, with its changes, by the task that adapts it.
+
+- `QuickRecorder/RecordEngine.swift`, the stream configuration in `record(filter:fastStart:)`
+  (lines 147-224 and 241-255) → `apps/macos/Sources/RecordMac/Capture/CaptureStreamConfiguration.swift`
+  (T029). Only the configuration is adapted; the rest of `RecordEngine.swift` is not carried.
+  - Inputs are an explicit `CaptureStreamSettings` value: pixel size, source rect, frame rate,
+    pointer, system audio, and microphone device. Upstream read them from preferences, the
+    filter, and `SCContext`.
+  - The pixel size is used as given. Upstream derived it from the filter's content rect or the
+    screen frame and the high-resolution preference. The source rect is taken in
+    ScreenCaptureKit's coordinates; upstream converted a bottom-left selection rectangle.
+  - `minimumFrameInterval` is `CMTime(value: 1, timescale: fps)` at 30, 60, 120, and 240 fps.
+    Upstream used a timescale of 0 at 60 fps and above. A rate outside that set, an empty pixel
+    size, an empty or non-finite source rect, and an empty microphone identifier are refused.
+  - `queueDepth` is 8 for every stream; upstream set it only for HDR. Frames are 32-bit BGRA in
+    sRGB, as upstream's SDR path.
+  - The microphone is selected by `captureMicrophone` and `microphoneCaptureDeviceID`; upstream
+    recorded it outside the stream, through `AECAudioStream`, `AVAudioEngine`, or an `AVCaptureSession`.
+  - Not carried: the HDR preset and PQ colour space, the background colour, the audio-only
+    stream, the `fastStart` cursor override, the H.264 hardware-encoder probe, and the
+    `SCContext.timeOffset` reset. Pause timing is `CaptureClock`'s.
+- `QuickRecorder/SCContext.swift` is not carried. Its stream, writer, and timing state belong
+  with the stream callbacks; its permission alerts, `AppDelegate` calls, previews, trimming, MP3
+  export, `mixAudioTracks`, and `AECAudioStream` engine are not used.
 
 ### From Screenize (`027be96`)
 
