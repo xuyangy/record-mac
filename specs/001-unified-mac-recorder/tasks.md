@@ -166,7 +166,7 @@ source is separately playable and the camera is separable from the screen.
 
 ### Tests for User Story 1
 
-- [ ] T057 [P] [US1] Write a separate-audio-track test in `apps/macos/Tests/RecordMacTests/Capture/AudioTrackSeparationTests.swift` asserting microphone and system audio are distinct writer inputs with no capture-time mixing (FR-017)
+- [X] T057 [P] [US1] Write a separate-audio-track test in `apps/macos/Tests/RecordMacTests/Capture/AudioTrackSeparationTests.swift` asserting microphone and system audio are distinct writer inputs with no capture-time mixing (FR-017)
 - [ ] T058 [P] [US1] Write a capture-priority test in `apps/macos/Tests/RecordMacTests/Capture/FrameDropPolicyTests.swift` asserting the engine sheds the composite track, then preview, and never a screen, camera, or audio frame (Principle I)
 - [ ] T059 [P] [US1] Write session-end tests in `apps/macos/Tests/RecordMacTests/Capture/SessionEndTests.swift`: sleep, lock, and user switch each stop cleanly with `endReason` set and a valid project; a camera held by another application fails at `prepare`; a recording under one second produces a valid project
 - [ ] T060 [P] [US1] Write frame-rate tests in `apps/macos/Tests/RecordMacTests/Capture/FrameRateTests.swift`: `offers` returns 30 and 60 for every source, 120 only at 120 Hz or more, 240 only at 240 Hz or more; `minimumFrameInterval` equals `CMTime(value: 1, timescale: fps)`; no frame is duplicated; an idle stretch keeps its duration (FR-074)
