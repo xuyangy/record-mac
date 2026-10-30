@@ -79,7 +79,10 @@ struct ScreenTrackOutcome: Equatable, Sendable {
 /// its complete frames are counted as delivered and rejected, with the reason; the first
 /// complete frame after a file has finished finalising ends that segment and opens a file from
 /// that frame on. The same counting, with the reason, applies when no file can be opened for a
-/// format. A complete frame without an image is counted as delivered and rejected in the open
+/// format. A complete frame at a new format is kept until the next frame, or until
+/// `sourceUnavailable(at:)` or `finish` shows where it lies: a frame stamped at or after the end
+/// of the recording opens no segment and is counted in `afterEnd`, since ScreenCaptureKit can
+/// stamp a frame slightly ahead of the stop. A complete frame without an image is counted as delivered and rejected in the open
 /// segment, or as unassigned when none is open.
 ///
 /// Each segment's file has its own timeline, starting at zero at the segment's start; its
@@ -106,6 +109,9 @@ final class ScreenSegmentWriter: @unchecked Sendable {
     private let frameRate: Double
     private let lock = NSLock()
     private var current: Current?
+    /// A complete frame at a new format, kept until the next frame or `finish` decides whether it
+    /// starts a segment.
+    private var boundary: CMSampleBuffer?
     private var nextIndex = 0
     private var finalizing = 0
     private var unassigned = ScreenSegmentFrames(written: .noFramesAppended)
@@ -123,28 +129,60 @@ final class ScreenSegmentWriter: @unchecked Sendable {
     func receive(_ sampleBuffer: CMSampleBuffer, status: ScreenFrameStatus) {
         lock.withLock {
             guard !finished, status == .complete else { return }
-            guard let format = ScreenFrameFormat(sampleBuffer) else {
-                if current == nil {
-                    unassigned.delivered += 1
-                    unassigned.appendRejected += 1
-                } else {
-                    current?.failure.delivered += 1
-                    current?.failure.appendRejected += 1
-                }
+            takeBoundary()
+            if let open = current, let format = ScreenFrameFormat(sampleBuffer),
+               open.format != format || (open.saturated && finalizing < maxOpenFiles) {
+                boundary = sampleBuffer
                 return
             }
-            let time = sampleBuffer.presentationTimeStamp
-            if let open = current, open.format != format || (open.saturated && finalizing < maxOpenFiles) {
-                endCurrent(at: time)
-            }
-            if current == nil { open(format, at: time) }
-            if let counter = current?.counter {
-                counter.receive(sampleBuffer, status: .complete)
+            take(sampleBuffer)
+        }
+    }
+
+    /// Routes a complete frame into the segments. Called with the lock held.
+    private func take(_ sampleBuffer: CMSampleBuffer) {
+        guard let format = ScreenFrameFormat(sampleBuffer) else {
+            if current == nil {
+                unassigned.delivered += 1
+                unassigned.appendRejected += 1
             } else {
                 current?.failure.delivered += 1
                 current?.failure.appendRejected += 1
             }
+            return
         }
+        let time = sampleBuffer.presentationTimeStamp
+        if let open = current, open.format != format || (open.saturated && finalizing < maxOpenFiles) {
+            endCurrent(at: time)
+        }
+        if current == nil { open(format, at: time) }
+        if let counter = current?.counter {
+            counter.receive(sampleBuffer, status: .complete)
+        } else {
+            current?.failure.delivered += 1
+            current?.failure.appendRejected += 1
+        }
+    }
+
+    /// Starts the segment a kept boundary frame opens, once a later frame shows it belongs in the
+    /// recording. Called with the lock held.
+    private func takeBoundary() {
+        guard let frame = boundary else { return }
+        boundary = nil
+        take(frame)
+    }
+
+    /// At `time`, the end of the recording or of the source: a kept boundary frame stamped
+    /// before it starts its segment; one stamped at or after it opens none, and at the end of the
+    /// recording it is counted in `afterEnd`. Called with the lock held.
+    private func settleBoundary(before time: CMTime, endingRecording: Bool) {
+        guard let frame = boundary, frame.presentationTimeStamp >= time else {
+            takeBoundary()
+            return
+        }
+        guard endingRecording else { return }
+        boundary = nil
+        if current == nil { unassigned.afterEnd += 1 } else { current?.failure.afterEnd += 1 }
     }
 
     /// Ends the current segment at `time`, when the source stops delivering, for example while
@@ -152,6 +190,7 @@ final class ScreenSegmentWriter: @unchecked Sendable {
     func sourceUnavailable(at time: CMTime) {
         lock.withLock {
             guard !finished else { return }
+            settleBoundary(before: time, endingRecording: false)
             endCurrent(at: time)
         }
     }
@@ -161,6 +200,7 @@ final class ScreenSegmentWriter: @unchecked Sendable {
         let tasks = lock.withLock { () -> [Task<ScreenSegmentOutcome, Never>] in
             if !finished {
                 finished = true
+                settleBoundary(before: time, endingRecording: true)
                 endCurrent(at: time)
             }
             return ended
@@ -217,6 +257,7 @@ final class ScreenSegmentWriter: @unchecked Sendable {
             lock.withLock { finalizing -= 1 }
             frames.delivered += segment.failure.delivered
             frames.appendRejected += segment.failure.appendRejected
+            frames.afterEnd += segment.failure.afterEnd
             return ScreenSegmentOutcome(
                 format: segment.format, start: segment.start, end: end,
                 segment: MediaSegment(

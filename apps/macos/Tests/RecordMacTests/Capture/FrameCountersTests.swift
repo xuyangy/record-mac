@@ -143,6 +143,25 @@ final class FrameCountersTests: XCTestCase {
         XCTAssertEqual(timing.duration, 0.8, accuracy: 0.01)
     }
 
+    func testAHeldFrameStampedAtOrAfterTheEndIsNotWritten() async throws {
+        for stamp in [0.8, 0.81] {
+            let writer = try realWriter()
+            let counter = ScreenFrameCounter(writer: writer)
+            counter.receive(try frame(at: 0), status: .complete)
+            counter.receive(try frame(at: 0.5), status: .complete)
+            counter.receive(try frame(at: stamp), status: .complete)
+            let counts = await counter.finish(endingAt: time(0.8))
+            XCTAssertEqual(counts.delivered, 2, "\(stamp)")
+            XCTAssertEqual(counts.afterEnd, 1, "\(stamp)")
+            XCTAssertEqual(counts.accepted, 2, "\(stamp)")
+            XCTAssertEqual(counts.written, .decoded(2), "\(stamp)")
+            XCTAssertNil(counts.unexplainedLoss, "\(stamp)")
+            let timing = try await timing(of: writer.url)
+            XCTAssertEqual(timing.samples.count, 2, "the file holds no frame past its end")
+            XCTAssertEqual(timing.duration, 0.8, accuracy: 0.01)
+        }
+    }
+
     func testWithoutAnyCompleteFrameNoImageIsWritten() async throws {
         let writer = try realWriter()
         let counter = ScreenFrameCounter(writer: writer)

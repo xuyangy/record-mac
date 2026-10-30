@@ -40,6 +40,10 @@ struct ScreenSegmentFrames: Equatable, Sendable {
     var writerFailure: String?
     /// Frames in the finalised file, counted by decoding it; nil until finished.
     var written: WrittenFrameCount?
+    /// Complete frames stamped at or after the segment's end, not written and not counted as
+    /// delivered: ScreenCaptureKit can stamp a frame slightly ahead, so one can arrive just before
+    /// the stop takes effect.
+    var afterEnd = 0
 
     /// Accepted frames missing from the file because the writer failed, when the file could be
     /// counted.
@@ -93,7 +97,8 @@ protocol ScreenSampleWriting: AnyObject {
 /// segment's end. An unchanged stretch, the final hold, and a recording with no change after its
 /// first frame are therefore held by one frame's duration, never by a duplicated frame. Before
 /// the first complete frame nothing is held, since there is no image yet. At most one frame is
-/// kept back.
+/// kept back; if it is stamped at or after the end given to `finish`, it is not written and is
+/// counted in `afterEnd` instead of `delivered`.
 final class ScreenFrameCounter: @unchecked Sendable {
     private let writer: ScreenSampleWriting
     private let lock = NSLock()
@@ -127,7 +132,14 @@ final class ScreenFrameCounter: @unchecked Sendable {
         let task = lock.withLock { () -> Task<ScreenSegmentFrames, Never> in
             if let finishing { return finishing }
             finished = true
-            if let pending { write(pending, until: endTime) }
+            if let pending {
+                if pending.presentationTimeStamp < endTime {
+                    write(pending, until: endTime)
+                } else {
+                    frames.delivered -= 1
+                    frames.afterEnd += 1
+                }
+            }
             pending = nil
             let task = Task { [self] in
                 let failure = await writer.finish(endingAt: endTime)

@@ -118,6 +118,50 @@ final class SegmentWriterTests: XCTestCase {
         XCTAssertEqual(FrameReport(segments: outcomes.map(\.frames)), FrameReport(delivered: 3, appendRejected: 0, writerFailed: 0, written: 3))
     }
 
+    func testANewFormatStampedAfterTheEndOpensNoSegment() async throws {
+        let factory = MovieFactory(directory: directory)
+        let writer = makeWriter(factory)
+        writer.receive(try frame(at: 0.1, width: 256, height: 144), status: .complete)
+        writer.receive(try frame(at: 0.81, width: 512, height: 288), status: .complete)
+        let result = await writer.finish(at: time(0.8))
+
+        XCTAssertEqual(factory.opened.count, 1)
+        XCTAssertEqual(result.segments.count, 1)
+        XCTAssertEqual(result.segments[0].end.seconds, 0.8, accuracy: 1e-9)
+        XCTAssertEqual(result.segments[0].frames.delivered, 1)
+        XCTAssertEqual(result.segments[0].frames.afterEnd, 1)
+        XCTAssertEqual(result.segments[0].frames.written, .decoded(1))
+        let movie = try await describe("screen-0.mov")
+        XCTAssertEqual(movie.duration, 0.7, accuracy: 0.01, "the file ends at the recording's end")
+    }
+
+    func testANewFormatBeforeTheEndStartsItsSegmentAtFinish() async throws {
+        let factory = MovieFactory(directory: directory)
+        let writer = makeWriter(factory)
+        writer.receive(try frame(at: 0), status: .complete)
+        writer.receive(try frame(at: 0.5, width: 96, height: 48), status: .complete)
+        let result = await writer.finish(at: time(0.8))
+
+        XCTAssertEqual(result.segments.map(\.start.seconds), [0, 0.5])
+        XCTAssertEqual(result.segments.map(\.end.seconds), [0.5, 0.8])
+        XCTAssertEqual(result.segments.map(\.frames.written), [.decoded(1), .decoded(1)])
+        XCTAssertEqual(result.segments.map(\.frames.afterEnd), [0, 0])
+    }
+
+    func testANewFormatAfterTheSourceWentAwayStartsAfterTheGap() async throws {
+        let factory = MovieFactory(directory: directory)
+        let writer = makeWriter(factory)
+        writer.receive(try frame(at: 0), status: .complete)
+        writer.receive(try frame(at: 1.2, width: 96, height: 48), status: .complete)
+        writer.sourceUnavailable(at: time(1))
+        writer.receive(try frame(at: 1.5, width: 96, height: 48), status: .complete)
+        let result = await writer.finish(at: time(2))
+
+        XCTAssertEqual(result.segments.map(\.start.seconds), [0, 1.2])
+        XCTAssertEqual(result.segments.map(\.end.seconds), [1, 2])
+        XCTAssertEqual(result.segments.map(\.frames.delivered), [1, 2])
+    }
+
     func testAPixelFormatChangeAloneStartsANewSegment() async throws {
         let factory = MovieFactory(directory: directory)
         let writer = makeWriter(factory)
@@ -222,6 +266,8 @@ final class SegmentWriterTests: XCTestCase {
         let writer = makeWriter(factory)
         writer.receive(try frame(at: 0), status: .complete)
         writer.receive(try frame(at: 1, width: 96, height: 48), status: .complete)
+        // The next frame shows the new format belongs in the recording, so the first segment ends.
+        writer.receive(try frame(at: 1.5, width: 96, height: 48), status: .complete)
         await withCheckedContinuation { continuation in
             DispatchQueue.global().async { [entered = factory.first.entered] in
                 entered.wait()
@@ -299,8 +345,9 @@ final class SegmentWriterTests: XCTestCase {
         let writer = ScreenSegmentWriter(factory: factory, deviceID: "display:1", frameRate: 60, maxOpenFiles: 2)
         writer.receive(try frame(at: 0, width: 64), status: .complete)
         writer.receive(try frame(at: 1, width: 80), status: .complete)
-        XCTAssertEqual(writer.openFiles, 2)
+        XCTAssertEqual(writer.openFiles, 1, "a new format waits for the next frame")
         writer.receive(try frame(at: 2, width: 96), status: .complete)
+        XCTAssertEqual(writer.openFiles, 2)
         writer.receive(try frame(at: 3, width: 112), status: .complete)
         writer.receive(try frame(at: 3.5, width: 112), status: .complete)
         XCTAssertEqual(factory.opened.count, 2, "no third file while two are open")
@@ -309,6 +356,7 @@ final class SegmentWriterTests: XCTestCase {
         factory.release.signal()
         while writer.openFiles > 1 { try await Task.sleep(nanoseconds: 5_000_000) }
         writer.receive(try frame(at: 4, width: 112), status: .complete)
+        writer.receive(try frame(at: 4.5, width: 112), status: .complete)
         XCTAssertEqual(factory.opened.map(\.start.seconds), [0, 1, 4], "a file opens again once one has finalised")
         for _ in 0..<3 { factory.release.signal() }
         let result = await writer.finish(at: time(5))
