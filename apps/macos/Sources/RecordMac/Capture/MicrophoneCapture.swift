@@ -22,6 +22,11 @@ struct AudioTrackCounts: Equatable, Sendable {
     var writerFailure: String?
     /// Frames in the finalised file, read back; nil until finished.
     var written: WrittenFrameCount?
+    /// Session time of the first sample the writer took; nil while it has taken none.
+    var firstSampleTime: CMTime?
+    /// Session time where the samples the writer took end: the latest end of any buffer it took,
+    /// its time plus its duration. Not evidence that the samples between are contiguous.
+    var endTime: CMTime?
 }
 
 /// Where an audio track's buffers go: an `AVAssetWriter` input in production, a scripted one in
@@ -43,7 +48,11 @@ protocol AudioSampleSink: AnyObject {
 ///
 /// Buffers arrive stamped on the session clock. The file's timeline starts at zero at `start`,
 /// the segment's start on the session clock, so the first buffer sits at its offset from it.
-/// The first buffer's format is the track's; a buffer in any other format is refused and counted.
+/// Without a `start`, it starts at the first sample the writer takes: the file opens at the
+/// first buffer's time, and if the writer refuses that buffer before it has taken any, the file
+/// is discarded and the next buffer opens it again at its own time, so a refused buffer never
+/// moves the start. The first buffer's format is the track's; a buffer in any other format is
+/// refused and counted.
 ///
 /// At most `pendingLimit` seconds of audio are held at once, counted when `append` is called and
 /// covering buffers both queued and waiting for the writer; beyond that the newest buffer is
@@ -55,10 +64,12 @@ protocol AudioSampleSink: AnyObject {
 final class AudioTrackWriter: @unchecked Sendable {
     let source: AudioCaptureSource
     let url: URL
-    let start: CMTime
+    /// The file's timeline zero on the session clock; nil for the first sample taken.
+    let start: CMTime?
     let pendingLimit: Double
 
-    private let makeSink: (CMFormatDescription, AudioStreamBasicDescription) throws -> AudioSampleSink
+    /// Opens the sink with its timeline zero at the given session time.
+    private let makeSink: (CMFormatDescription, AudioStreamBasicDescription, CMTime) throws -> AudioSampleSink
     private let queue: DispatchQueue
     /// Guards admission: frames held, frames dropped on admission, and whether admission has
     /// closed. A buffer is admitted and queued under it, so closing it orders every admitted
@@ -69,6 +80,8 @@ final class AudioTrackWriter: @unchecked Sendable {
     private var admissionClosed = false
     private var sink: AudioSampleSink?
     private var format: AudioStreamBasicDescription?
+    /// The first buffer's format description, which opens the sink.
+    private var firstDescription: CMFormatDescription?
     private var pending: [CMSampleBuffer] = []
     private var retryScheduled = false
     private var counts = AudioTrackCounts()
@@ -76,14 +89,14 @@ final class AudioTrackWriter: @unchecked Sendable {
     private let finishLock = NSLock()
 
     init(
-        source: AudioCaptureSource, url: URL, start: CMTime, pendingLimit: Double = 2,
-        makeSink: ((CMFormatDescription, AudioStreamBasicDescription) throws -> AudioSampleSink)? = nil
+        source: AudioCaptureSource, url: URL, start: CMTime?, pendingLimit: Double = 2,
+        makeSink: ((CMFormatDescription, AudioStreamBasicDescription, CMTime) throws -> AudioSampleSink)? = nil
     ) {
         self.source = source
         self.url = url
         self.start = start
         self.pendingLimit = pendingLimit
-        self.makeSink = makeSink ?? { description, asbd in
+        self.makeSink = makeSink ?? { description, asbd, start in
             try AssetAudioSampleSink(url: url, start: start, description: description, asbd: asbd)
         }
         queue = DispatchQueue(label: "local.recordmac.audio-track.\(source.rawValue)")
@@ -164,13 +177,9 @@ final class AudioTrackWriter: @unchecked Sendable {
             }
         } else {
             format = asbd
-            do {
-                sink = try makeSink(description, asbd)
-            } catch {
-                counts.writerFailure = "\(error)"
-            }
+            firstDescription = description
         }
-        guard counts.writerFailure == nil, sink != nil else {
+        guard counts.writerFailure == nil else {
             counts.rejectedAppendFrames += frames
             release(frames)
             return
@@ -179,9 +188,21 @@ final class AudioTrackWriter: @unchecked Sendable {
         drain()
     }
 
+    /// Opens the sink for the first waiting buffer: at `start`, or at that buffer's time.
+    private func openSink() -> AudioSampleSink? {
+        if let sink { return sink }
+        guard let buffer = pending.first, let format, let firstDescription else { return nil }
+        do {
+            sink = try makeSink(firstDescription, format, start ?? buffer.presentationTimeStamp)
+        } catch {
+            stop(with: "\(error)")
+        }
+        return sink
+    }
+
     private func drain() {
-        guard let sink else { return }
         while let buffer = pending.first {
+            guard let sink = openSink() else { return }
             if let failure = sink.terminalFailure {
                 stop(with: failure)
                 return
@@ -192,10 +213,23 @@ final class AudioTrackWriter: @unchecked Sendable {
             release(frames)
             if sink.append(buffer) {
                 counts.appendedFrames += frames
+                let time = buffer.presentationTimeStamp
+                let duration = CMSampleBufferGetDuration(buffer)
+                let end = duration.isNumeric ? time + duration
+                    : time + CMTime(seconds: Double(frames) / (format?.mSampleRate ?? 1), preferredTimescale: 1_000_000_000)
+                counts.firstSampleTime = counts.firstSampleTime ?? time
+                counts.endTime = counts.endTime.map { max($0, end) } ?? end
             } else {
                 counts.rejectedAppendFrames += frames
+                if start == nil, counts.appendedFrames == 0, sink.terminalFailure == nil {
+                    // Nothing taken yet: discard the file so the next buffer opens it at its own time.
+                    sink.cancel()
+                    try? FileManager.default.removeItem(at: url)
+                    self.sink = nil
+                }
             }
         }
+        guard let sink else { return }
         if let failure = sink.terminalFailure, !pending.isEmpty {
             stop(with: failure)
         } else if !pending.isEmpty, !retryScheduled {
@@ -340,8 +374,9 @@ final class AssetAudioSampleSink: AudioSampleSink {
 final class AudioSourceWriters: @unchecked Sendable {
     private let writers: [AudioCaptureSource: AudioTrackWriter]
 
-    /// `makeURL` gives each source its own file.
-    init(sources: Set<AudioCaptureSource>, start: CMTime, makeURL: (AudioCaptureSource) -> URL) {
+    /// `makeURL` gives each source its own file; `start` is each file's timeline zero, nil for its
+    /// first sample.
+    init(sources: Set<AudioCaptureSource>, start: CMTime?, makeURL: (AudioCaptureSource) -> URL) {
         var writers: [AudioCaptureSource: AudioTrackWriter] = [:]
         for source in sources {
             writers[source] = AudioTrackWriter(source: source, url: makeURL(source), start: start)

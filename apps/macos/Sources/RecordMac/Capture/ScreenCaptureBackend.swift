@@ -165,7 +165,7 @@ final class ScreenCaptureBackend: CaptureBackend {
             if options.systemAudio { sources.insert(.systemAudio) }
             if options.microphoneDeviceID != nil { sources.insert(.microphone) }
             let directory = directory
-            let audio = AudioSourceWriters(sources: sources, start: .zero) {
+            let audio = AudioSourceWriters(sources: sources, start: nil) {
                 directory.appendingPathComponent("\($0.rawValue).mov")
             }
             self.audio = audio
@@ -221,12 +221,14 @@ final class ScreenCaptureBackend: CaptureBackend {
         }
         for (source, kind) in [(AudioCaptureSource.systemAudio, MediaTrackKind.systemAudio), (.microphone, .microphone)] {
             guard let counts = report.audio[source], counts.appendedFrames > 0,
+                  let first = counts.firstSampleTime, let last = counts.endTime,
                   let url = audio?.writer(for: source)?.url
             else { continue }
             let deviceID = source == .microphone ? options?.microphoneDeviceID ?? "microphone" : "system-audio"
+            // The file starts at its first sample; the segment spans the samples written.
             tracks.append(MediaTrack(
                 kind: kind,
-                segments: [MediaSegment(fileRef: url.lastPathComponent, start: 0, end: end.seconds, deviceID: deviceID)],
+                segments: [MediaSegment(fileRef: url.lastPathComponent, start: first.seconds, end: last.seconds, deviceID: deviceID)],
                 endedEarlyAt: endedEarlyAt))
         }
         return tracks

@@ -178,6 +178,8 @@ extension ScreenFrameCounter {
 
 /// An `AVAssetWriter` writing one screen segment to a movie file.
 final class AssetScreenSampleWriter: ScreenSampleWriting, @unchecked Sendable {
+    static let timeScale: CMTimeScale = 90_000
+
     let url: URL
     private let writer: AVAssetWriter
     private let input: AVAssetWriterInput
@@ -187,6 +189,11 @@ final class AssetScreenSampleWriter: ScreenSampleWriting, @unchecked Sendable {
         writer = try AVAssetWriter(outputURL: url, fileType: fileType)
         input = AVAssetWriterInput(mediaType: .video, outputSettings: outputSettings)
         input.expectsMediaDataInRealTime = true
+        // At the default 1/600 s, a frame just before the segment's end can be rounded past it
+        // and lost from the file. 1/90,000 s rounds by at most 11 µs and still lets one frame
+        // last 13 hours, which a frame's 32-bit duration in the file must hold.
+        input.mediaTimeScale = Self.timeScale
+        writer.movieTimeScale = Self.timeScale
         guard writer.canAdd(input) else {
             throw writer.error ?? CocoaError(.featureUnsupported)
         }

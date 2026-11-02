@@ -199,7 +199,17 @@ final class LiveCaptureTests: XCTestCase {
             .filter { later, earlier in !recording.pauseSeams.contains { earlier <= $0 && $0 <= later } }
             .map { $0 - $1 }
         let smallest = gaps.min() ?? .infinity
-        XCTAssertGreaterThanOrEqual(smallest, 1 / Double(rate) - 0.002, "no two frames closer than the rate allows", file: file, line: line)
+        // No frame is written twice, and no more frames are written than the rate allows over
+        // the recording. ScreenCaptureKit paces delivery to whole display refreshes, so one
+        // interval can be shorter than 1/rate; the smallest is reported, not required.
+        XCTAssertGreaterThan(smallest, 0.001, "no frame is written twice", file: file, line: line)
+        XCTAssertLessThanOrEqual(Double(times.count), Double(rate) * (segment.end - segment.start) + 1,
+            "no more frames than the rate allows", file: file, line: line)
+        let shortGaps = zip(times.dropFirst(), times)
+            .filter { later, earlier in later - earlier < 1 / Double(rate) - 0.002 }
+            .map { later, earlier in String(format: "%.4f-%.4f", earlier, later) }
+        let early = gaps.filter { $0 < 1 / Double(rate) - 0.002 }.count
+        print("LIVE \(rate) fps short intervals: \(shortGaps); pause seams \(recording.pauseSeams.map { String(format: "%.4f", $0) })")
         XCTAssertLessThanOrEqual(times.last ?? 0, segment.end + 1e-6, file: file, line: line)
 
         // System audio: its own track and file, every sample the writer took is in the file, and
@@ -213,25 +223,35 @@ final class LiveCaptureTests: XCTestCase {
         XCTAssertEqual(audio.written, .decoded(audio.appendedFrames), file: file, line: line)
         let timeline = try await audioTimeline(recording.directory.appendingPathComponent(try XCTUnwrap(system.segments.first).fileRef))
         XCTAssertEqual(timeline.frames, audio.appendedFrames, file: file, line: line)
-        let audioStart = try XCTUnwrap(timeline.start, file: file, line: line)
-        let audioEnd = timeline.end
-        let trackEnd = system.segments.last?.end ?? 0
-        let audioGaps = timeline.gaps.map { String(format: "%.4f s at %.4f s", $0.length, $0.at) }
+        // The file starts at its first sample, so its timeline mapped by the segment's start
+        // covers the segment exactly.
+        XCTAssertEqual(system.segments.count, 1, file: file, line: line)
+        let audioSegment = try XCTUnwrap(system.segments.first, file: file, line: line)
+        let sample = 1 / timeline.sampleRate
+        let fileStart = try XCTUnwrap(timeline.start, file: file, line: line)
+        XCTAssertEqual(audioSegment.start + fileStart, audioSegment.start, accuracy: sample, "the file starts at the segment's start", file: file, line: line)
+        XCTAssertEqual(audioSegment.start + timeline.end, audioSegment.end, accuracy: sample, "the file ends at the segment's end", file: file, line: line)
+        let audioURL = recording.directory.appendingPathComponent(audioSegment.fileRef)
+        let fileDuration = try await AVURLAsset(url: audioURL).load(.duration).seconds
+        XCTAssertEqual(fileDuration, audioSegment.end - audioSegment.start, accuracy: 0.002,
+            "the file holds no time before its first sample", file: file, line: line)
+        let screenEnd = screen.segments.last?.end ?? 0
+        XCTAssertLessThanOrEqual(audioSegment.end, screenEnd + 1e-6, "no audio past the recording's end", file: file, line: line)
+        let audioGaps = timeline.gaps.map { String(format: "%.4f s at %.4f s", $0.length, audioSegment.start + $0.at) }
         print("""
             LIVE \(rate) fps audio: \(timeline.frames) sample frames at \(timeline.sampleRate) Hz, \
-            \(timeline.channels) channels; first sample at \(String(format: "%.4f", audioStart)) s, \
-            last ends at \(String(format: "%.4f", audioEnd)) s; segment end \(String(format: "%.4f", trackEnd)) s; \
-            uncovered at the start \(String(format: "%.4f", audioStart)) s, at the end \(String(format: "%.4f", trackEnd - audioEnd)) s; \
+            \(timeline.channels) channels; segment \(String(format: "%.4f", audioSegment.start))-\(String(format: "%.4f", audioSegment.end)) s; \
+            file \(String(format: "%.4f", fileStart))-\(String(format: "%.4f", timeline.end)) s, duration \(String(format: "%.4f", fileDuration)) s; \
+            recording ends \(String(format: "%.4f", screenEnd)) s; no audio for the last \(String(format: "%.4f", screenEnd - audioSegment.end)) s; \
             gaps inside \(audioGaps.isEmpty ? "none" : audioGaps.joined(separator: ", "))
             """)
-        XCTAssertGreaterThanOrEqual(audioStart, 0, file: file, line: line)
-        XCTAssertLessThanOrEqual(audioEnd, trackEnd + 1e-6, "no audio past the end", file: file, line: line)
         print("""
             LIVE \(rate) fps: \(segment.nativeSize.map { "\($0.width)x\($0.height)" } ?? "?") \
             segments \(screen.segments.count) end \(String(format: "%.3f", screen.segments.last?.end ?? 0)) s; \
             afterEnd \(recording.report.screen?.segments.map(\.frames.afterEnd).reduce(0, +) ?? -1); \
             delivered \(frames.delivered) rejected \(frames.appendRejected) written \(frames.written) \
-            writerFailed \(frames.writerFailed); smallest gap \(String(format: "%.4f", smallest)) s; \
+            writerFailed \(frames.writerFailed); smallest gap \(String(format: "%.4f", smallest)) s, \
+            \(early) of \(gaps.count) shorter than 1/\(rate) s; \
             excluded \(recording.report.router?.screen.excluded ?? -1); statuses \(recording.report.router?.screenStatuses ?? [:]); \
             encoder \(recording.report.encoders.map { "\($0.format.codec.rawValue) \($0.path.rawValue) \($0.encoderID)" }); \
             system audio written \(audio.written.map { "\($0)" } ?? "-") \

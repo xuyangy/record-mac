@@ -101,7 +101,8 @@ final class MicrophoneCaptureTests: XCTestCase {
         track.append(second)
         let counts = await track.finish()
 
-        XCTAssertEqual(counts, AudioTrackCounts(receivedFrames: 8820, appendedFrames: 8820, written: .decoded(8820)))
+        XCTAssertEqual(counts, AudioTrackCounts(receivedFrames: 8820, appendedFrames: 8820, written: .decoded(8820),
+            firstSampleTime: CMTime(value: 463_050, timescale: 44_100), endTime: CMTime(value: 471_870, timescale: 44_100)))
         let file = try await AudioFixtures.read(track.url)
         XCTAssertEqual(file.format.mSampleRate, 44_100)
         XCTAssertEqual(file.format.mChannelsPerFrame, 1)
@@ -234,7 +235,8 @@ final class MicrophoneCaptureTests: XCTestCase {
         let track = writer()
         track.append(buffer)
         let counts = await track.finish()
-        XCTAssertEqual(counts, AudioTrackCounts(receivedFrames: frames, appendedFrames: frames, written: .decoded(frames)))
+        XCTAssertEqual(counts, AudioTrackCounts(receivedFrames: frames, appendedFrames: frames, written: .decoded(frames),
+            firstSampleTime: seconds(10), endTime: seconds(10.1)))
         let file = try await AudioFixtures.read(track.url)
         XCTAssertEqual(file.format.mBitsPerChannel, 24)
         XCTAssertEqual(file.format.mChannelsPerFrame, 2)
@@ -257,6 +259,74 @@ final class MicrophoneCaptureTests: XCTestCase {
             }
         }
         XCTAssertEqual(mismatches, 0, "every sample value kept")
+    }
+
+    func testWithoutAStartTheFileRunsFromItsFirstSampleToItsLast() async throws {
+        let format = try XCTUnwrap(AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 44_100, channels: 1, interleaved: true))
+        let track = AudioTrackWriter(source: .microphone, url: directory.appendingPathComponent("microphone.mov"), start: nil)
+        let (first, firstBytes) = try AudioFixtures.buffer(format: format, frames: 4410, start: 10.5, seed: 1)
+        let (second, secondBytes) = try AudioFixtures.buffer(format: format, frames: 4410, start: 10.6, seed: 2)
+        track.append(first)
+        track.append(second)
+        let counts = await track.finish()
+
+        XCTAssertEqual(try XCTUnwrap(counts.firstSampleTime).seconds, 10.5, accuracy: 1e-9)
+        XCTAssertEqual(try XCTUnwrap(counts.endTime).seconds, 10.7, accuracy: 1e-9)
+        let file = try await AudioFixtures.read(track.url)
+        XCTAssertEqual(file.firstTime, 0, accuracy: 1e-9, "the file starts at its first sample")
+        let duration = try await AVURLAsset(url: track.url).load(.duration)
+        XCTAssertEqual(duration.seconds, 0.2, accuracy: 1e-3, "the file holds no time before its first sample")
+        XCTAssertEqual(Double(file.frames) / 44_100, 0.2, accuracy: 1e-9, "and ends where its last sample ends")
+        XCTAssertEqual(file.bytes, firstBytes + secondBytes)
+    }
+
+    /// Refuses the appends whose call numbers it is given, and records where each file opened.
+    private final class RefusingSink: AudioSampleSink, @unchecked Sendable {
+        let refused: Set<Int>
+        private(set) var calls = 0
+        private(set) var cancelled = 0
+        init(refusing refused: Set<Int>) { self.refused = refused }
+        var isReadyForMoreMediaData: Bool { true }
+        var terminalFailure: String? { nil }
+        func append(_ buffer: CMSampleBuffer) -> Bool {
+            defer { calls += 1 }
+            return !refused.contains(calls)
+        }
+        func finish() async -> String? { nil }
+        func cancel() { cancelled += 1 }
+        func readBackFrames() async -> WrittenFrameCount { .decoded(0) }
+    }
+
+    func testRefusedBuffersAtEitherEdgeDoNotWidenTheExtent() async throws {
+        let format = try XCTUnwrap(AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 44_100, channels: 1, interleaved: true))
+        let sink = RefusingSink(refusing: [0, 2])
+        var opened: [Double] = []
+        let track = AudioTrackWriter(source: .microphone, url: directory.appendingPathComponent("refusing.mov"), start: nil) { _, _, start in
+            opened.append(start.seconds)
+            return sink
+        }
+        for start in [1.0, 1.1, 1.2] { track.append(try AudioFixtures.buffer(format: format, frames: 4410, start: start, seed: 1).0) }
+        let counts = await track.finish()
+
+        XCTAssertEqual(opened, [1.0, 1.1], "a file whose first buffer was refused opens again at the next one")
+        XCTAssertEqual(sink.cancelled, 1)
+        XCTAssertEqual(counts.appendedFrames, 4410)
+        XCTAssertEqual(counts.rejectedAppendFrames, 8820)
+        XCTAssertEqual(try XCTUnwrap(counts.firstSampleTime).seconds, 1.1, accuracy: 1e-9)
+        XCTAssertEqual(try XCTUnwrap(counts.endTime).seconds, 1.2, accuracy: 1e-9)
+    }
+
+    func testATrackThatTookNothingHasNoExtent() async throws {
+        let format = try XCTUnwrap(AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 44_100, channels: 1, interleaved: true))
+        let sink = RefusingSink(refusing: [0, 1])
+        let track = AudioTrackWriter(source: .microphone, url: directory.appendingPathComponent("refusing.mov"), start: nil) { _, _, _ in sink }
+        for start in [1.0, 1.1] { track.append(try AudioFixtures.buffer(format: format, frames: 4410, start: start, seed: 1).0) }
+        let counts = await track.finish()
+
+        XCTAssertEqual(counts.appendedFrames, 0)
+        XCTAssertNil(counts.firstSampleTime)
+        XCTAssertNil(counts.endTime)
+        XCTAssertEqual(counts.written, .noFramesAppended)
     }
 
     func testABufferInAnotherFormatIsRefusedAndCounted() async throws {
@@ -305,7 +375,7 @@ final class MicrophoneCaptureTests: XCTestCase {
 
     private func scriptedTrack(_ sink: ScriptedSink) -> AudioTrackWriter {
         AudioTrackWriter(source: .microphone, url: directory.appendingPathComponent("scripted.mov"),
-            start: seconds(0), pendingLimit: 2) { _, _ in sink }
+            start: seconds(0), pendingLimit: 2) { _, _, _ in sink }
     }
 
     func testABurstAgainstAStalledWriterHoldsAtMostTheLimitAndCountsTheRest() async throws {

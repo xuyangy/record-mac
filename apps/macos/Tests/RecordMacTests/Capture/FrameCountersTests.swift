@@ -162,6 +162,25 @@ final class FrameCountersTests: XCTestCase {
         }
     }
 
+    func testAFrameJustBeforeTheEndIsKeptInTheFile() async throws {
+        let writer = try realWriter()
+        let counter = ScreenFrameCounter(writer: writer)
+        counter.receive(try frame(at: 0), status: .complete)
+        var timing = CMSampleTimingInfo(duration: .invalid,
+            presentationTimeStamp: CMTime(value: 1_999_900_000, timescale: 1_000_000_000), decodeTimeStamp: .invalid)
+        var late: CMSampleBuffer?
+        XCTAssertEqual(CMSampleBufferCreateCopyWithNewTiming(allocator: nil, sampleBuffer: try frame(at: 0, shade: 40),
+            sampleTimingEntryCount: 1, sampleTimingArray: &timing, sampleBufferOut: &late), noErr)
+        counter.receive(try XCTUnwrap(late), status: .complete)
+        let counts = await counter.finish(endingAt: CMTime(value: 2_000_000_000, timescale: 1_000_000_000))
+
+        XCTAssertEqual(counts.written, .decoded(2), "a frame 0.1 ms before the end is not rounded past it")
+        XCTAssertNil(counts.unexplainedLoss)
+        let tracks = try await AVURLAsset(url: writer.url).loadTracks(withMediaType: .video)
+        let timeScale = try await XCTUnwrap(tracks.first).load(.naturalTimeScale)
+        XCTAssertEqual(timeScale, 90_000)
+    }
+
     func testWithoutAnyCompleteFrameNoImageIsWritten() async throws {
         let writer = try realWriter()
         let counter = ScreenFrameCounter(writer: writer)

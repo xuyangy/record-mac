@@ -318,6 +318,38 @@ final class ScreenCaptureBackendTests: XCTestCase {
         XCTAssertEqual(backend.report.frameReport?.written, 1)
     }
 
+    func testAnAudioSegmentSpansItsSamplesAndAPauseLeavesItContinuous() async throws {
+        let clock = CaptureClock(epochHostTime: host(epoch))
+        let backend = try await started(options(systemAudio: true), clock: clock)
+        XCTAssertTrue(clock.pause(atHostTime: host(epoch + 0.2)))
+        XCTAssertTrue(clock.resume(atHostTime: host(epoch + 0.3)))
+        let format = try XCTUnwrap(AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48_000, channels: 2, interleaved: true))
+        var kept = Data()
+        for (index, start) in [0.05, 0.15, 0.25, 0.35, 0.45].enumerated() {
+            let (packet, bytes) = try AudioFixtures.buffer(format: format, frames: 4800, start: epoch + start, seed: index)
+            stream.deliver(packet, .audio)
+            switch index {
+            case 1: kept.append(bytes.prefix(2400 * 8))
+            case 2: kept.append(bytes.suffix(2400 * 8))
+            default: kept.append(bytes)
+            }
+        }
+        stream.deliver(try frame(at: 0.1), .screen)
+        await drain()
+
+        let tracks = try await backend.stop(atHostTime: host(epoch + 0.7))
+
+        let segment = try XCTUnwrap(tracks.first { $0.kind == .systemAudio }?.segments.first)
+        XCTAssertEqual(segment.start, 0.05, accuracy: 1e-9, "the first sample, not the session start")
+        XCTAssertEqual(segment.end, 0.45, accuracy: 1e-9, "the last sample's end, not the stop")
+        let file = try await AudioFixtures.read(directory.appendingPathComponent(segment.fileRef))
+        XCTAssertEqual(file.firstTime, 0, accuracy: 1e-9)
+        XCTAssertEqual(segment.start + Double(file.frames) / 48_000, segment.end, accuracy: 1e-9)
+        let duration = try await AVURLAsset(url: directory.appendingPathComponent(segment.fileRef)).load(.duration)
+        XCTAssertEqual(duration.seconds, segment.end - segment.start, accuracy: 1e-3, "the file holds no time before its first sample")
+        XCTAssertEqual(file.bytes, kept, "the samples around the pause, unchanged and in order")
+    }
+
     // MARK: - Failures
 
     func testAnOutputThatCannotBeAddedFailsStartAndStopStillFinalises() async throws {
