@@ -17,6 +17,25 @@ struct GeometrySegment: Codable, Hashable, Sendable {
     var scaleFactor: Double
 }
 
+extension GeometrySegment {
+    /// A finite start at or above zero, a finite origin and size whose stored width and height
+    /// are above zero (`CGRect.width` and `height` read a negative size as positive), a pixel
+    /// width and height above zero, and a finite scale factor above zero.
+    var isValid: Bool {
+        let (origin, size) = (sourceRect.origin, sourceRect.size)
+        return start.isFinite && start >= 0
+            && origin.x.isFinite && origin.y.isFinite && size.width.isFinite && size.height.isFinite
+            && size.width > 0 && size.height > 0
+            && pixelSize.width > 0 && pixelSize.height > 0
+            && scaleFactor.isFinite && scaleFactor > 0
+    }
+
+    /// Whether the two describe the same source, whatever their starts.
+    func sameSource(as other: GeometrySegment) -> Bool {
+        sourceRect == other.sourceRect && pixelSize == other.pixelSize && scaleFactor == other.scaleFactor
+    }
+}
+
 extension Array where Element == GeometrySegment {
     /// The segment in force at `time`: the last one starting at or before it. Segments are
     /// ordered by `start`; a time before the first segment has none.

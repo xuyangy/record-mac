@@ -45,14 +45,7 @@ struct ActivityStreamBuilder {
     /// Adds the geometry starting at `segment.start`; throws, adding nothing, if it is invalid,
     /// the first does not start at zero, or it does not start after the last.
     mutating func add(_ segment: GeometrySegment) throws {
-        // The stored size, not `width` and `height`, which read a negative size as positive.
-        let (origin, size) = (segment.sourceRect.origin, segment.sourceRect.size)
-        guard segment.start.isFinite, segment.start >= 0,
-              origin.x.isFinite, origin.y.isFinite, size.width.isFinite, size.height.isFinite,
-              size.width > 0, size.height > 0,
-              segment.pixelSize.width > 0, segment.pixelSize.height > 0,
-              segment.scaleFactor.isFinite, segment.scaleFactor > 0
-        else { throw ActivityStreamBuildError.invalidGeometry(start: segment.start) }
+        guard segment.isValid else { throw ActivityStreamBuildError.invalidGeometry(start: segment.start) }
         if let last = geometry.last {
             guard segment.start > last.start else { throw ActivityStreamBuildError.geometryOutOfOrder(start: segment.start) }
         } else {
