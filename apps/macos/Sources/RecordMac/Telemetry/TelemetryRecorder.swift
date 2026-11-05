@@ -2,19 +2,23 @@ import CoreGraphics
 import CoreMedia
 import Foundation
 
-/// Pointer activity in global screen points (top-left origin of the main display), before it is
-/// converted to capture coordinates. It is not an `ActivityEvent`, whose location is in capture
-/// coordinates; that conversion needs the recording's geometry.
+/// Pointer activity in global screen points (top-left origin of the main display), and
+/// frontmost-window changes, before they are converted to capture coordinates. It is not an
+/// `ActivityEvent`, whose location is in capture coordinates; that conversion needs the
+/// recording's geometry.
 struct GlobalActivityEvent: Equatable, Sendable {
     /// Session time on the capture clock.
     var sessionTime: CMTime
     var kind: ActivityEventKind
-    var globalPoint: CGPoint
+    /// For pointer kinds.
+    var globalPoint: CGPoint?
     /// The mouse button, for click and drag kinds.
     var button: Int?
     /// The element at `globalPoint` when the event was delivered, which can differ from the
     /// element there when the event happened.
     var target: ElementDescriptor?
+    /// `activeWindowChange` only: the window frontmost when the change was observed.
+    var window: WindowDescriptor?
 }
 
 /// The fields of a pointer CGEvent the recorder reads. Key events are never read.
@@ -111,6 +115,21 @@ struct PointerTranslator: Sendable {
 /// What a session counted. Every pointer event the tap delivered to the session while it was
 /// admitting is in exactly one count.
 struct TelemetryRecorderCounts: Equatable, Sendable {
+    /// What became of the frontmost-window observations the session admitted or refused. Each
+    /// observation the source reported while the session was admitting is in exactly one count.
+    struct Windows: Equatable, Sendable {
+        /// A window other than the last one recorded: an `activeWindowChange` was delivered.
+        var recorded = 0
+        /// The window last recorded is still frontmost.
+        var unchanged = 0
+        /// No window could be read; the last one recorded stands.
+        var unavailable = 0
+        var droppedSuspended = 0
+        /// Before the epoch, inside a pause, or after the end.
+        var droppedNoSessionTime = 0
+        var droppedOverflow = 0
+    }
+
     var delivered = 0
     var droppedSuspended = 0
     /// Before the epoch, inside a pause, or with an unset timestamp.
@@ -119,6 +138,7 @@ struct TelemetryRecorderCounts: Equatable, Sendable {
     /// A release that ended no drag carries nothing new.
     var notRecorded = 0
     var tapReenabled = 0
+    var windows = Windows()
 }
 
 enum TelemetryRecorderStatus: Equatable, Sendable {
@@ -143,13 +163,25 @@ protocol PointerEventTap: AnyObject, Sendable {
     func stop()
 }
 
-/// Records pointer activity from a listen-only event tap (T041 part 1).
+/// Records pointer activity from a listen-only event tap, and frontmost-window changes from a
+/// `FrontmostWindowSource` (T041).
 ///
 /// On the tap's thread, each event is checked against suspension at the moment it arrives, then
 /// stamped on the capture clock and queued, all under one lock; the tap never waits on
 /// Accessibility or the sink. A serial queue resolves each event's target and hands it to the
 /// sink in arrival order, whether or not a target resolves. At most `capacity` events wait;
 /// beyond that the newest is dropped and counted.
+///
+/// A frontmost-window observation is stamped with the host time the source observed it and
+/// admitted like a pointer event, taking its place on the serial queue under the lock. Only then
+/// is the window frontmost read, on the source's thread, outside the lock; the queue waits at
+/// that place for the reading, so later pointer events and observations stay behind it, while
+/// the tap is never held. On the queue the window is delivered as an `activeWindowChange` only
+/// if it differs from the last window the session recorded; the first window read in a session
+/// is always recorded. When no window can be read, nothing is delivered and the last window
+/// recorded stands, so a return to it records nothing new. An observation dropped while
+/// suspended or paused reads no window and records nothing; `observeWindow(atHostTime:)` asks
+/// for a fresh one, for example on resume.
 ///
 /// Each start begins a session. Stopping a session closes its admission under the lock that
 /// admits and queues events, stops the tap, then queues the session's end, so every event it
@@ -163,6 +195,8 @@ final class TelemetryRecorder: @unchecked Sendable {
         var admitting = true
         var failed = false
         var counts = TelemetryRecorderCounts()
+        /// The window last delivered. Read and written only on the serial queue.
+        var lastWindow: WindowDescriptor?
     }
 
     let capacity: Int
@@ -171,6 +205,7 @@ final class TelemetryRecorder: @unchecked Sendable {
     private let filter: ActivityEventFilter
     private let resolver: TargetResolver
     private let tap: PointerEventTap
+    private let windows: FrontmostWindowSource?
     private let sink: @Sendable (GlobalActivityEvent) -> Void
     private let schedule: @Sendable (@escaping @Sendable () -> Void) -> Void
     private let worker = DispatchQueue(label: "local.recordmac.telemetry-recorder")
@@ -186,11 +221,13 @@ final class TelemetryRecorder: @unchecked Sendable {
     private var pending = 0
 
     /// `schedule` runs work off the tap's thread; tests replace it to force an interleaving.
+    /// With no `windows` source, no window changes are recorded.
     init(
         clock: CaptureClock,
         filter: ActivityEventFilter,
         resolver: TargetResolver = TargetResolver(),
         tap: PointerEventTap = SystemPointerEventTap(),
+        windows: FrontmostWindowSource? = nil,
         capacity: Int = 4096,
         schedule: @escaping @Sendable (@escaping @Sendable () -> Void) -> Void = { DispatchQueue.global().async(execute: $0) },
         sink: @escaping @Sendable (GlobalActivityEvent) -> Void
@@ -199,6 +236,7 @@ final class TelemetryRecorder: @unchecked Sendable {
         self.filter = filter
         self.resolver = resolver
         self.tap = tap
+        self.windows = windows
         self.capacity = capacity
         self.schedule = schedule
         self.sink = sink
@@ -207,7 +245,10 @@ final class TelemetryRecorder: @unchecked Sendable {
     /// A recorder released while running stops its tap. It does not wait, so a release on the
     /// tap's own thread cannot deadlock.
     deinit {
-        if lock.withLock({ current }) != nil { tap.stop() }
+        if lock.withLock({ current }) != nil {
+            tap.stop()
+            windows?.stop()
+        }
     }
 
     var status: TelemetryRecorderStatus {
@@ -247,6 +288,11 @@ final class TelemetryRecorder: @unchecked Sendable {
                     current = nil
                     lastStatus = .tapUnavailable
                     lastSession = session
+                }
+            } else {
+                _ = windows?.start { [weak self, weak session] hostTime in
+                    guard let self, let session else { return }
+                    self.observeWindow(atHostTime: hostTime, in: session)
                 }
             }
             return status
@@ -297,6 +343,72 @@ final class TelemetryRecorder: @unchecked Sendable {
         }
     }
 
+    /// Asks for the frontmost window as of `hostTime` in the running session, as if the source had
+    /// observed a change then.
+    func observeWindow(atHostTime hostTime: CMTime) {
+        guard let session = lock.withLock({ current }) else { return }
+        observeWindow(atHostTime: hostTime, in: session)
+    }
+
+    /// The window an admitted observation read, handed from the source's thread to the queue.
+    private final class WindowReading: @unchecked Sendable {
+        private let ready = DispatchSemaphore(value: 0)
+        private var lookup = FrontmostWindowLookup.unavailable
+
+        func fill(_ lookup: FrontmostWindowLookup) {
+            self.lookup = lookup
+            ready.signal()
+        }
+
+        func wait() -> FrontmostWindowLookup {
+            ready.wait()
+            return lookup
+        }
+    }
+
+    /// Runs on the source's thread.
+    private func observeWindow(atHostTime hostTime: CMTime, in session: Session) {
+        let suspended = filter.isSuspended
+        let reading: WindowReading? = lock.withLock {
+            guard session.admitting else { return nil }
+            guard !suspended else {
+                session.counts.windows.droppedSuspended += 1
+                return nil
+            }
+            guard let sessionTime = clock.sessionTime(forHostTime: hostTime) else {
+                session.counts.windows.droppedNoSessionTime += 1
+                return nil
+            }
+            guard pending < capacity else {
+                session.counts.windows.droppedOverflow += 1
+                return nil
+            }
+            pending += 1
+            let reading = WindowReading()
+            // Queued under the lock, so it keeps its place among pointer events and precedes any
+            // end of this session queued after it.
+            worker.async { [self] in deliverWindow(reading.wait(), at: sessionTime, in: session) }
+            return reading
+        }
+        // Every admitted observation fills its reading, so the queue never waits past it.
+        reading?.fill(windows?.frontmostWindow() ?? .unavailable)
+    }
+
+    private func deliverWindow(_ lookup: FrontmostWindowLookup, at sessionTime: CMTime, in session: Session) {
+        lock.withLock { pending -= 1 }
+        guard case .window(let window) = lookup else {
+            lock.withLock { session.counts.windows.unavailable += 1 }
+            return
+        }
+        guard window != session.lastWindow else {
+            lock.withLock { session.counts.windows.unchanged += 1 }
+            return
+        }
+        session.lastWindow = window
+        lock.withLock { session.counts.windows.recorded += 1 }
+        sink(GlobalActivityEvent(sessionTime: sessionTime, kind: .activeWindowChange, window: window))
+    }
+
     /// A dropped press, drag, or release loses a transition, so press state is forgotten rather
     /// than completed from a guess. Called with the lock held.
     private func drop(_ sample: PointerSample, _ count: inout Int) {
@@ -342,6 +454,7 @@ final class TelemetryRecorder: @unchecked Sendable {
             translator.reset()
         }
         tap.stop()
+        windows?.stop()
         worker.async { [self] in
             completion(lock.withLock { session.counts })
         }
@@ -350,7 +463,7 @@ final class TelemetryRecorder: @unchecked Sendable {
     private func deliver(_ event: GlobalActivityEvent, in session: Session) {
         lock.withLock { pending -= 1 }
         var event = event
-        event.target = resolver.target(at: event.globalPoint)
+        event.target = event.globalPoint.flatMap { resolver.target(at: $0) }
         lock.withLock { session.counts.delivered += 1 }
         sink(event)
     }
