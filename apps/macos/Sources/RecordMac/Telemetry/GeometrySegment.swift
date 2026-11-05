@@ -7,10 +7,13 @@ import Foundation
 struct GeometrySegment: Codable, Hashable, Sendable {
     /// Time on the capture clock. The first segment starts at zero.
     var start: TimeInterval
-    /// The captured area, in global display points.
+    /// The captured area, in global display points: origin at the top left of the main display,
+    /// y downwards, the space of CGEvent locations.
     var sourceRect: CGRect
+    /// The captured frame's size; with `sourceRect` it gives the capture mapping on each axis.
     var pixelSize: PixelSize
-    /// Backing scale of the display.
+    /// Backing scale of the display. Not used to map locations, since a native size rounded to
+    /// whole pixels need not be exactly `sourceRect` times this.
     var scaleFactor: Double
 }
 

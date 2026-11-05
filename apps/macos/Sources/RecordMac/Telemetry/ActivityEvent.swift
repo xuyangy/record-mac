@@ -63,7 +63,8 @@ enum ButtonOrKey: Codable, Hashable, Sendable {
     }
 }
 
-/// The frontmost window, by identity and frame only, never by title (FR-024).
+/// The frontmost window, by identity and frame only, never by title (FR-024). The frame is in
+/// global display points, origin at the top left of the main display.
 struct WindowDescriptor: Codable, Hashable, Sendable {
     var bundleIdentifier: String
     var windowID: UInt32
@@ -71,7 +72,7 @@ struct WindowDescriptor: Codable, Hashable, Sendable {
 }
 
 /// An on-screen element from Accessibility: role, identifier, and frame only, never its value
-/// (FR-023).
+/// (FR-023). The frame is in global display points, origin at the top left of the main display.
 struct ElementDescriptor: Codable, Hashable, Sendable {
     var role: String
     var subrole: String?
@@ -84,7 +85,9 @@ struct ActivityEvent: Codable, Hashable, Sendable {
     /// Time on the capture clock.
     var timestamp: TimeInterval
     var kind: ActivityEventKind
-    /// Capture coordinates, for pointer-bearing kinds.
+    /// Capture coordinates, for pointer-bearing kinds: pixels of the captured frame from its top
+    /// left, mapped with the GeometrySegment in force at `timestamp`. A pointer outside the
+    /// source lies outside 0..<pixel width and 0..<pixel height.
     var location: CGPoint?
     var buttonOrKey: ButtonOrKey?
     /// `activeWindowChange` only.
