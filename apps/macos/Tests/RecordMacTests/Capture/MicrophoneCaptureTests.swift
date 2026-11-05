@@ -29,8 +29,9 @@ enum AudioFixtures {
         var bytes = Data()
         for list in lists { bytes.append(Data(bytes: list.mData!, count: Int(list.mDataByteSize))) }
         let rate = Int32(format.sampleRate)
+        // Rounded to the nearest sample: `CMTime(seconds:)` can land one sample early.
         var timing = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: rate),
-            presentationTimeStamp: CMTime(seconds: start, preferredTimescale: rate), decodeTimeStamp: .invalid)
+            presentationTimeStamp: CMTime(value: Int64((start * Double(rate)).rounded()), timescale: rate), decodeTimeStamp: .invalid)
         var sample: CMSampleBuffer?
         CMSampleBufferCreate(allocator: nil, dataBuffer: nil, dataReady: false, makeDataReadyCallback: nil,
             refcon: nil, formatDescription: format.formatDescription, sampleCount: frames,
@@ -278,6 +279,31 @@ final class MicrophoneCaptureTests: XCTestCase {
         XCTAssertEqual(duration.seconds, 0.2, accuracy: 1e-3, "the file holds no time before its first sample")
         XCTAssertEqual(Double(file.frames) / 44_100, 0.2, accuracy: 1e-9, "and ends where its last sample ends")
         XCTAssertEqual(file.bytes, firstBytes + secondBytes)
+    }
+
+    /// The file plays buffers back to back whatever their times, so a buffer that does not start
+    /// where the last one ended is counted: a gap and an overlap here, each more than half a
+    /// sample; a start a third of a sample off is not.
+    func testABufferThatDoesNotContinueTheLastIsCounted() async throws {
+        let format = try XCTUnwrap(AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 44_100, channels: 1, interleaved: true))
+        let track = AudioTrackWriter(source: .microphone, url: directory.appendingPathComponent("microphone.mov"), start: nil)
+        let sample = 1.0 / 44_100
+        for (index, start) in [10.0, 10.1, 10.2 + sample, 10.3].enumerated() {
+            track.append(try AudioFixtures.buffer(format: format, frames: 4410, start: start, seed: index).0)
+        }
+        // A third of a sample late, on a timescale three times the sample rate.
+        let last = try AudioFixtures.buffer(format: format, frames: 4410, start: 10.4, seed: 4).0
+        var timing = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: 44_100),
+            presentationTimeStamp: CMTime(value: 1_375_920 + 1, timescale: 132_300), decodeTimeStamp: .invalid)
+        var shifted: CMSampleBuffer?
+        XCTAssertEqual(CMSampleBufferCreateCopyWithNewTiming(allocator: nil, sampleBuffer: last, sampleTimingEntryCount: 1,
+            sampleTimingArray: &timing, sampleBufferOut: &shifted), noErr)
+        XCTAssertEqual(try XCTUnwrap(shifted).presentationTimeStamp.seconds, 10.4 + sample / 3, accuracy: 1e-12)
+        track.append(try XCTUnwrap(shifted))
+        let counts = await track.finish()
+
+        XCTAssertEqual(counts.appendedFrames, 5 * 4410)
+        XCTAssertEqual(counts.discontinuities, 2, "a gap of one sample, then an overlap of one")
     }
 
     /// Refuses the appends whose call numbers it is given, and records where each file opened.

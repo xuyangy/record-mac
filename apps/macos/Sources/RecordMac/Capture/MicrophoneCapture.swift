@@ -27,6 +27,10 @@ struct AudioTrackCounts: Equatable, Sendable {
     /// Session time where the samples the writer took end: the latest end of any buffer it took,
     /// its time plus its duration. Not evidence that the samples between are contiguous.
     var endTime: CMTime?
+    /// Buffers taken that did not start where the buffer taken before them ended, within half a
+    /// sample. The file holds its samples back to back whatever their times, so each one moves
+    /// every later sample from its time.
+    var discontinuities = 0
 }
 
 /// Where an audio track's buffers go: an `AVAssetWriter` input in production, a scripted one in
@@ -85,6 +89,8 @@ final class AudioTrackWriter: @unchecked Sendable {
     private var pending: [CMSampleBuffer] = []
     private var retryScheduled = false
     private var counts = AudioTrackCounts()
+    /// Where the last buffer taken ended.
+    private var lastEnd: CMTime?
     private var finishing: Task<AudioTrackCounts, Never>?
     private let finishLock = NSLock()
 
@@ -217,6 +223,9 @@ final class AudioTrackWriter: @unchecked Sendable {
                 let duration = CMSampleBufferGetDuration(buffer)
                 let end = duration.isNumeric ? time + duration
                     : time + CMTime(seconds: Double(frames) / (format?.mSampleRate ?? 1), preferredTimescale: 1_000_000_000)
+                let halfSample = 0.5 / (format?.mSampleRate ?? 1)
+                if let lastEnd, abs((time - lastEnd).seconds) > halfSample { counts.discontinuities += 1 }
+                lastEnd = end
                 counts.firstSampleTime = counts.firstSampleTime ?? time
                 counts.endTime = counts.endTime.map { max($0, end) } ?? end
             } else {
