@@ -4,10 +4,50 @@ import CoreMedia
 import XCTest
 @testable import RecordMac
 
+/// The largest magnitude among the 32-bit float samples in `block`, copied out of every memory
+/// block it spans.
+func floatPeak(_ block: CMBlockBuffer) throws -> Float {
+    let length = CMBlockBufferGetDataLength(block)
+    guard length % MemoryLayout<Float>.size == 0 else { throw CocoaError(.fileReadCorruptFile) }
+    var floats = [Float](repeating: 0, count: length / MemoryLayout<Float>.size)
+    let status = floats.withUnsafeMutableBytes {
+        CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: length, destination: $0.baseAddress!)
+    }
+    guard status == kCMBlockBufferNoErr else { throw NSError(domain: NSOSStatusErrorDomain, code: Int(status)) }
+    return floats.reduce(0) { max($0, abs($1)) }
+}
+
+final class FloatPeakTests: XCTestCase {
+    /// A buffer made of two memory blocks, the louder sample in the second.
+    func testThePeakCoversEveryBlockOfABuffer() throws {
+        func block(_ values: [Float]) throws -> CMBlockBuffer {
+            var block: CMBlockBuffer?
+            let length = values.count * MemoryLayout<Float>.size
+            XCTAssertEqual(CMBlockBufferCreateWithMemoryBlock(allocator: nil, memoryBlock: nil, blockLength: length,
+                blockAllocator: nil, customBlockSource: nil, offsetToData: 0, dataLength: length, flags: 0,
+                blockBufferOut: &block), kCMBlockBufferNoErr)
+            let result = try XCTUnwrap(block)
+            _ = values.withUnsafeBytes { CMBlockBufferReplaceDataBytes(with: $0.baseAddress!, blockBuffer: result,
+                offsetIntoDestination: 0, dataLength: length) }
+            return result
+        }
+        let joined = try block([0.1, -0.2])
+        XCTAssertEqual(CMBlockBufferAppendBufferReference(joined, targetBBuf: try block([0.05, -0.75, 0.3]),
+            offsetToData: 0, dataLength: 0, flags: 0), kCMBlockBufferNoErr)
+        XCTAssertFalse(CMBlockBufferIsRangeContiguous(joined, atOffset: 0, length: 0), "two memory blocks")
+        XCTAssertEqual(try floatPeak(joined), 0.75)
+        XCTAssertEqual(try floatPeak(try block([-0.5, 0.25])), 0.5)
+    }
+}
+
 /// Records the main display through `CaptureEngine` and `ScreenCaptureBackend` with a real
 /// ScreenCaptureKit stream. Runs only with `RECORDMAC_LIVE_CAPTURE=1`, since it needs the Screen
 /// Recording permission and moves the pointer: this app's own windows are left out of a display
 /// capture, so the moving pointer is what changes the picture.
+///
+/// The microphone case runs only with `RECORDMAC_LIVE_MICROPHONE` set as well: to a microphone's
+/// unique ID, or to `default` for the system's default input. It needs the Microphone permission,
+/// and someone should speak or tap the microphone while it records.
 @MainActor
 final class LiveCaptureTests: XCTestCase {
     private var directory: URL!
@@ -35,8 +75,8 @@ final class LiveCaptureTests: XCTestCase {
             displayID: display, windowID: nil, area: nil, thumbnailData: nil)
     }
 
-    private func options(rate: Int) -> CaptureEngineOptions {
-        CaptureEngineOptions(microphoneDeviceID: nil, systemAudio: true, cameraDeviceID: nil, includesPointer: true,
+    private func options(rate: Int, microphone: String?) -> CaptureEngineOptions {
+        CaptureEngineOptions(microphoneDeviceID: microphone, systemAudio: true, cameraDeviceID: nil, includesPointer: true,
             frameRate: rate, wantsAlpha: false, keepsPresenterComposite: false)
     }
 
@@ -74,8 +114,11 @@ final class LiveCaptureTests: XCTestCase {
     }
 
     /// Records for `seconds` of session time, pausing for `pause` seconds after `pauseAfter`.
-    private func record(rate: Int, seconds: Double, pauseAfter: Double? = nil, pause: Double = 0) async throws -> Recording {
-        let recordingDirectory = directory.appendingPathComponent("\(rate)fps-\(pauseAfter == nil ? "plain" : "paused")")
+    private func record(
+        rate: Int, seconds: Double, pauseAfter: Double? = nil, pause: Double = 0, microphone: String? = nil
+    ) async throws -> Recording {
+        let recordingDirectory = directory.appendingPathComponent(
+            "\(rate)fps-\(pauseAfter == nil ? "plain" : "paused")\(microphone == nil ? "" : "-microphone")")
         var backend: ScreenCaptureBackend!
         let engine = CaptureEngine(
             makeBackend: { _ in
@@ -84,7 +127,7 @@ final class LiveCaptureTests: XCTestCase {
             },
             refreshRate: { [display] _ in CoreGraphicsDisplayRefreshSource().refreshRate(of: display) })
         XCTAssertTrue(engine.offers(source).frameRates.contains(rate), "\(rate) fps is offered")
-        let session = try await engine.prepare(source, options(rate: rate))
+        let session = try await engine.prepare(source, options(rate: rate, microphone: microphone))
         let mover = PointerMover(display: display)
         defer { mover.stop() }
         let clock = try await engine.start(session)
@@ -168,6 +211,71 @@ final class LiveCaptureTests: XCTestCase {
         return timeline
     }
 
+    /// The largest sample magnitude in an audio file, from 0 to 1.
+    private func peak(_ url: URL) async throws -> Float {
+        let asset = AVURLAsset(url: url)
+        let tracks = try await asset.loadTracks(withMediaType: .audio)
+        let track = try XCTUnwrap(tracks.first)
+        let reader = try AVAssetReader(asset: asset)
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings: [
+            AVFormatIDKey: kAudioFormatLinearPCM, AVLinearPCMBitDepthKey: 32, AVLinearPCMIsFloatKey: true,
+            AVLinearPCMIsNonInterleaved: false, AVLinearPCMIsBigEndianKey: false,
+        ])
+        reader.add(output)
+        XCTAssertTrue(reader.startReading())
+        var peak: Float = 0
+        while let sample = output.copyNextSampleBuffer() {
+            guard sample.numSamples > 0 else { continue }
+            let block = try XCTUnwrap(CMSampleBufferGetDataBuffer(sample), "decoded audio has its samples")
+            peak = max(peak, try floatPeak(block))
+        }
+        XCTAssertEqual(reader.status, .completed, String(describing: reader.error))
+        return peak
+    }
+
+    /// Checks one audio source's track against its file: its own track and file, every sample
+    /// the writer took is in the file, nothing was refused, and the file's timeline mapped by
+    /// the segment's start covers the segment exactly.
+    @discardableResult
+    private func checkAudio(
+        _ recording: Recording, _ source: AudioCaptureSource, _ kind: MediaTrackKind, rate: Int,
+        file: StaticString = #filePath, line: UInt = #line
+    ) async throws -> (segment: MediaSegment, timeline: AudioTimeline, peak: Float) {
+        let track = try XCTUnwrap(recording.tracks.first { $0.kind == kind }, "a \(kind) track", file: file, line: line)
+        let audio = try XCTUnwrap(recording.report.audio[source], file: file, line: line)
+        XCTAssertNil(audio.writerFailure, file: file, line: line)
+        XCTAssertEqual(audio.rejectedAppendFrames + audio.rejectedFormatFrames + audio.droppedOverflowFrames, 0, file: file, line: line)
+        XCTAssertEqual(recording.report.router?.audio[source]?.failed, [:], file: file, line: line)
+        XCTAssertGreaterThan(audio.appendedFrames, 0, file: file, line: line)
+        XCTAssertEqual(audio.written, .decoded(audio.appendedFrames), file: file, line: line)
+        XCTAssertEqual(track.segments.count, 1, file: file, line: line)
+        let segment = try XCTUnwrap(track.segments.first, file: file, line: line)
+        let url = recording.directory.appendingPathComponent(segment.fileRef)
+        let timeline = try await audioTimeline(url)
+        XCTAssertEqual(timeline.frames, audio.appendedFrames, file: file, line: line)
+        let sample = 1 / timeline.sampleRate
+        let fileStart = try XCTUnwrap(timeline.start, file: file, line: line)
+        XCTAssertEqual(segment.start + fileStart, segment.start, accuracy: sample, "the file starts at the segment's start", file: file, line: line)
+        XCTAssertEqual(segment.start + timeline.end, segment.end, accuracy: sample, "the file ends at the segment's end", file: file, line: line)
+        let fileDuration = try await AVURLAsset(url: url).load(.duration).seconds
+        XCTAssertEqual(fileDuration, segment.end - segment.start, accuracy: 0.002,
+            "the file holds no time before its first sample", file: file, line: line)
+        let screen = try XCTUnwrap(recording.tracks.first { $0.kind == .screen }, file: file, line: line)
+        let screenEnd = screen.segments.last?.end ?? 0
+        XCTAssertLessThanOrEqual(segment.end, screenEnd + 1e-6, "no audio past the recording's end", file: file, line: line)
+        let level = try await peak(url)
+        let gaps = timeline.gaps.map { String(format: "%.4f s at %.4f s", $0.length, segment.start + $0.at) }
+        print("""
+            LIVE \(rate) fps \(source.rawValue) \(segment.deviceID) \(segment.fileRef): \(timeline.frames) sample frames at \(timeline.sampleRate) Hz, \
+            \(timeline.channels) channels; segment \(String(format: "%.4f", segment.start))-\(String(format: "%.4f", segment.end)) s; \
+            file \(String(format: "%.4f", fileStart))-\(String(format: "%.4f", timeline.end)) s, duration \(String(format: "%.4f", fileDuration)) s; \
+            recording ends \(String(format: "%.4f", screenEnd)) s; no audio for the last \(String(format: "%.4f", screenEnd - segment.end)) s; \
+            gaps inside \(gaps.isEmpty ? "none" : gaps.joined(separator: ", ")); peak \(String(format: "%.4f", level)); \
+            excluded \(recording.report.router?.audio[source]?.excluded ?? -1)
+            """)
+        return (segment, timeline, level)
+    }
+
     private func check(_ recording: Recording, rate: Int, sessionSeconds: Double, file: StaticString = #filePath, line: UInt = #line) async throws {
         let screen = try XCTUnwrap(recording.tracks.first { $0.kind == .screen }, file: file, line: line)
         for track in recording.tracks { XCTAssertNoThrow(try track.validate(), file: file, line: line) }
@@ -212,39 +320,14 @@ final class LiveCaptureTests: XCTestCase {
         print("LIVE \(rate) fps short intervals: \(shortGaps); pause seams \(recording.pauseSeams.map { String(format: "%.4f", $0) })")
         XCTAssertLessThanOrEqual(times.last ?? 0, segment.end + 1e-6, file: file, line: line)
 
-        // System audio: its own track and file, every sample the writer took is in the file, and
-        // nothing was refused. No audio was playing, so this shows routing, not fidelity.
-        let system = try XCTUnwrap(recording.tracks.first { $0.kind == .systemAudio }, "a system audio track", file: file, line: line)
+        // System audio. The test does not control what the Mac plays, so this shows routing, not
+        // fidelity.
+        try await checkAudio(recording, .systemAudio, .systemAudio, rate: rate, file: file, line: line)
         let audio = try XCTUnwrap(recording.report.audio[.systemAudio], file: file, line: line)
-        XCTAssertNil(audio.writerFailure, file: file, line: line)
-        XCTAssertEqual(audio.rejectedAppendFrames + audio.rejectedFormatFrames + audio.droppedOverflowFrames, 0, file: file, line: line)
-        XCTAssertEqual(recording.report.router?.audio[.systemAudio]?.failed, [:], file: file, line: line)
-        XCTAssertGreaterThan(audio.appendedFrames, 0, file: file, line: line)
-        XCTAssertEqual(audio.written, .decoded(audio.appendedFrames), file: file, line: line)
-        let timeline = try await audioTimeline(recording.directory.appendingPathComponent(try XCTUnwrap(system.segments.first).fileRef))
-        XCTAssertEqual(timeline.frames, audio.appendedFrames, file: file, line: line)
-        // The file starts at its first sample, so its timeline mapped by the segment's start
-        // covers the segment exactly.
-        XCTAssertEqual(system.segments.count, 1, file: file, line: line)
-        let audioSegment = try XCTUnwrap(system.segments.first, file: file, line: line)
-        let sample = 1 / timeline.sampleRate
-        let fileStart = try XCTUnwrap(timeline.start, file: file, line: line)
-        XCTAssertEqual(audioSegment.start + fileStart, audioSegment.start, accuracy: sample, "the file starts at the segment's start", file: file, line: line)
-        XCTAssertEqual(audioSegment.start + timeline.end, audioSegment.end, accuracy: sample, "the file ends at the segment's end", file: file, line: line)
-        let audioURL = recording.directory.appendingPathComponent(audioSegment.fileRef)
-        let fileDuration = try await AVURLAsset(url: audioURL).load(.duration).seconds
-        XCTAssertEqual(fileDuration, audioSegment.end - audioSegment.start, accuracy: 0.002,
-            "the file holds no time before its first sample", file: file, line: line)
-        let screenEnd = screen.segments.last?.end ?? 0
-        XCTAssertLessThanOrEqual(audioSegment.end, screenEnd + 1e-6, "no audio past the recording's end", file: file, line: line)
-        let audioGaps = timeline.gaps.map { String(format: "%.4f s at %.4f s", $0.length, audioSegment.start + $0.at) }
-        print("""
-            LIVE \(rate) fps audio: \(timeline.frames) sample frames at \(timeline.sampleRate) Hz, \
-            \(timeline.channels) channels; segment \(String(format: "%.4f", audioSegment.start))-\(String(format: "%.4f", audioSegment.end)) s; \
-            file \(String(format: "%.4f", fileStart))-\(String(format: "%.4f", timeline.end)) s, duration \(String(format: "%.4f", fileDuration)) s; \
-            recording ends \(String(format: "%.4f", screenEnd)) s; no audio for the last \(String(format: "%.4f", screenEnd - audioSegment.end)) s; \
-            gaps inside \(audioGaps.isEmpty ? "none" : audioGaps.joined(separator: ", "))
-            """)
+        if recording.report.audio[.microphone] == nil {
+            XCTAssertFalse(recording.tracks.contains { $0.kind == .microphone }, "no microphone selected, no microphone track",
+                file: file, line: line)
+        }
         print("""
             LIVE \(rate) fps: \(segment.nativeSize.map { "\($0.width)x\($0.height)" } ?? "?") \
             segments \(screen.segments.count) end \(String(format: "%.3f", screen.segments.last?.end ?? 0)) s; \
@@ -282,5 +365,38 @@ final class LiveCaptureTests: XCTestCase {
         // Audio arrives in packets of about 10 ms; the excluded samples are those stamped inside
         // the pause, so their length matches the pause to within a packet or two.
         XCTAssertEqual(excludedAudio, pause, accuracy: 0.05, "the audio left out is the pause")
+    }
+
+    func testAMicrophoneIsRecordedToItsOwnFileBesideSystemAudio() async throws {
+        guard let selected = ProcessInfo.processInfo.environment["RECORDMAC_LIVE_MICROPHONE"] else {
+            throw XCTSkip("set RECORDMAC_LIVE_MICROPHONE to a microphone's unique ID, or to default, to record it")
+        }
+        let device = try XCTUnwrap(selected == "default"
+            ? AVCaptureDevice.default(for: .audio)
+            : AVCaptureDevice(uniqueID: selected), "the microphone \(selected) is connected")
+        if AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined {
+            _ = await AVCaptureDevice.requestAccess(for: .audio)
+        }
+        let status = AVCaptureDevice.authorizationStatus(for: .audio)
+        guard status == .authorized else {
+            XCTFail("Microphone is not granted to this process (status \(status.rawValue)); grant it to the terminal app and run again")
+            throw XCTSkip("no Microphone permission")
+        }
+        print("LIVE microphone: \(device.localizedName) \(device.uniqueID); speak or tap it now")
+
+        let recording = try await record(rate: 60, seconds: 3, pauseAfter: 1.5, pause: 1, microphone: device.uniqueID)
+        try await check(recording, rate: 60, sessionSeconds: 3)
+        let microphone = try await checkAudio(recording, .microphone, .microphone, rate: 60)
+        let system = try XCTUnwrap(recording.tracks.first { $0.kind == .systemAudio }?.segments.first)
+        XCTAssertEqual(microphone.segment.deviceID, device.uniqueID, "the selected microphone is kept")
+        XCTAssertNotEqual(microphone.segment.fileRef, system.fileRef, "its own file")
+        XCTAssertEqual(recording.report.audioWithoutSamples, [])
+        XCTAssertGreaterThan(microphone.peak, 0, "the file holds sound, not only zeros")
+
+        let pause = try XCTUnwrap(recording.pauseLengths.first)
+        let excludedSamples = try XCTUnwrap(recording.report.router?.audio[.microphone]?.excluded)
+        let excludedAudio = Double(excludedSamples) / microphone.timeline.sampleRate
+        print("LIVE microphone pause: \(String(format: "%.4f", pause)) s; excluded \(excludedSamples) sample frames, \(String(format: "%.4f", excludedAudio)) s")
+        XCTAssertEqual(excludedAudio, pause, accuracy: 0.05, "the microphone audio left out is the pause")
     }
 }

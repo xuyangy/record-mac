@@ -59,6 +59,8 @@ final class ScreenCaptureBackendTests: XCTestCase {
     private var directory: URL!
     private var stream: FakeStream!
     private var permitted = true
+    private var microphonePermitted = true
+    private var microphoneChecks = 0
     private var now = CMTime.zero
 
     override func setUp() async throws {
@@ -93,6 +95,10 @@ final class ScreenCaptureBackendTests: XCTestCase {
             },
             makeStream: { _, _, _ in stream },
             hasPermission: { [unowned self] in permitted },
+            microphonePermitted: { [unowned self] in
+                microphoneChecks += 1
+                return microphonePermitted
+            },
             hostTimeNow: { [unowned self] in now })
     }
 
@@ -171,6 +177,18 @@ final class ScreenCaptureBackendTests: XCTestCase {
         XCTAssertTrue(stream.outputs.isEmpty, "validate opens no stream")
     }
 
+    func testAMicrophoneNeedsItsPermissionAndNoMicrophoneNeedsNone() async throws {
+        microphonePermitted = false
+        await assertRefused(options(microphone: "mic-1")) { $0 == .permissionMissing("Microphone") }
+        XCTAssertEqual(microphoneChecks, 1)
+        XCTAssertTrue(stream.outputs.isEmpty, "validate opens no stream")
+
+        microphoneChecks = 0
+        _ = try await started(options(systemAudio: true), clock: CaptureClock(epochHostTime: host(epoch)))
+        XCTAssertEqual(microphoneChecks, 0, "no microphone, no microphone permission check")
+        XCTAssertEqual(stream.outputs.map(\.type), [.screen, .audio])
+    }
+
     func testStartBeforeValidateIsRefused() async {
         do {
             try await backend().start(clock: CaptureClock(epochHostTime: host(epoch)))
@@ -219,11 +237,25 @@ final class ScreenCaptureBackendTests: XCTestCase {
         XCTAssertEqual(backend.report.frameReport, FrameReport(delivered: 3, appendRejected: 0, writerFailed: 0, written: 3))
         XCTAssertEqual(backend.report.audio[.systemAudio]?.written, .decoded(19_200))
         XCTAssertEqual(backend.report.audio[.microphone]?.written, .decoded(17_640))
+        XCTAssertEqual(backend.report.audioWithoutSamples, [])
         XCTAssertEqual(backend.report.encoders.map(\.format.codec), [.hevc])
         XCTAssertEqual(stream.stopCalls, 1)
         for name in ["screen-0.mov", "systemAudio.mov", "microphone.mov"] {
             XCTAssertTrue(FileManager.default.fileExists(atPath: directory.appendingPathComponent(name).path), name)
         }
+    }
+
+    func testASelectedMicrophoneThatSentNothingHasNoTrackAndIsReported() async throws {
+        let backend = try await started(options(systemAudio: true, microphone: "mic-1"), clock: CaptureClock(epochHostTime: host(epoch)))
+        stream.deliver(try frame(at: 0.1), .screen)
+        stream.deliver(try audio(at: 0.1, rate: 48_000, channels: 2, seed: 3), .audio)
+        await drain()
+
+        let tracks = try await backend.stop(atHostTime: host(epoch + 0.5))
+
+        XCTAssertEqual(tracks.map(\.kind), [.screen, .systemAudio])
+        XCTAssertEqual(backend.report.audioWithoutSamples, [.microphone])
+        XCTAssertEqual(backend.report.audio[.microphone]?.receivedFrames, 0)
     }
 
     func testStoppingWhilePausedEndsAtThePause() async throws {

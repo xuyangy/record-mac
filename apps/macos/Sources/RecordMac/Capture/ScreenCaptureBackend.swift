@@ -52,6 +52,11 @@ struct ScreenCaptureBackendReport {
     var startFailure: String?
     var stopCaptureFailure: String?
 
+    /// The selected audio sources that wrote no sample, so have no track.
+    var audioWithoutSamples: [AudioCaptureSource] {
+        AudioCaptureSource.allCases.filter { audio[$0].map { $0.appendedFrames == 0 } ?? false }
+    }
+
     /// The four screen frame counters, with frames refused before the writer; nil when a
     /// segment's file could not be counted.
     var frameReport: FrameReport? {
@@ -68,7 +73,8 @@ struct ScreenCaptureBackendReport {
 /// The stream keeps running while paused; the session clock leaves paused samples out. Screen
 /// segments are HEVC, the encoder chosen per format by `EncoderSelector`. Alpha, the camera, and
 /// the Presenter Overlay composite are not captured here, so `validate` refuses them rather than
-/// recording without them.
+/// recording without them. A selected microphone needs Microphone permission already granted;
+/// the backend asks for no permission.
 ///
 /// `stop` ends the session clock at the stop before it stops the stream, so a buffer stamped at
 /// or after it is not written, and one stamped before it and still queued is. If the stream
@@ -87,6 +93,7 @@ final class ScreenCaptureBackend: CaptureBackend {
     private let resolve: Resolve
     private let makeStream: MakeStream
     private let hasPermission: () -> Bool
+    private let microphonePermitted: () -> Bool
     private let encoders: EncoderSelector
     private let queue = DispatchQueue(label: "local.recordmac.capture.samples")
     let stopObserver: StreamStopObserver
@@ -107,6 +114,7 @@ final class ScreenCaptureBackend: CaptureBackend {
         resolve: Resolve? = nil,
         makeStream: MakeStream? = nil,
         hasPermission: @escaping () -> Bool = { CGPreflightScreenCaptureAccess() },
+        microphonePermitted: @escaping () -> Bool = { AVCaptureDevice.authorizationStatus(for: .audio) == .authorized },
         encoders: EncoderSelector = EncoderSelector(),
         hostTimeNow: @escaping () -> CMTime = CaptureClock.hostTimeNow
     ) {
@@ -118,6 +126,7 @@ final class ScreenCaptureBackend: CaptureBackend {
             return LiveCaptureStream(filter: filter, configuration: configuration, delegate: delegate)
         }
         self.hasPermission = hasPermission
+        self.microphonePermitted = microphonePermitted
         self.encoders = encoders
     }
 
@@ -126,6 +135,9 @@ final class ScreenCaptureBackend: CaptureBackend {
 
     func validate(_ source: CaptureSource, _ options: CaptureEngineOptions) async throws {
         guard hasPermission() else { throw CapturePrepareError.permissionMissing("Screen Recording") }
+        if options.microphoneDeviceID != nil, !microphonePermitted() {
+            throw CapturePrepareError.permissionMissing("Microphone")
+        }
         if options.wantsAlpha {
             throw CapturePrepareError.settingsNotProducible("alpha capture is not available in the screen backend")
         }
