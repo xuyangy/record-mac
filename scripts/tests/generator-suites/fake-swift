@@ -1,0 +1,35 @@
+#!/bin/zsh
+# Stands in for swift in the generator suite gate's tests. FAKE_SWIFT_DIR holds:
+#   list.txt     what `swift test list` prints
+#   list.status  its exit status (default 0)
+#   failing      suites whose run fails, one per line
+#   empty        suites whose filter selects no test, one per line
+# Every call is appended to calls.log.
+
+set -u
+dir=$FAKE_SWIFT_DIR
+print -r -- "$*" >> "$dir/calls.log"
+
+if [[ ${1:-} == test && ${2:-} == list ]]; then
+    cat "$dir/list.txt"
+    exit $(cat "$dir/list.status" 2>/dev/null || print 0)
+fi
+
+filter=""
+while (( $# )); do
+    if [[ $1 == --filter ]]; then filter=$2; shift; fi
+    shift
+done
+# The filter is ^Module\.Suite/
+suite=${${filter#*\\.}%/}
+if grep -qxF -- "$suite" "$dir/empty" 2>/dev/null; then
+    print "warning: No matching test cases were run"
+    exit 0
+fi
+print "Test Suite '$suite' started at 2026-01-01 00:00:00.000."
+if grep -qxF -- "$suite" "$dir/failing" 2>/dev/null; then
+    print "Test Suite '$suite' failed at 2026-01-01 00:00:00.001."
+    exit 1
+fi
+print "Test Suite '$suite' passed at 2026-01-01 00:00:00.001."
+exit 0
