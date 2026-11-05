@@ -122,7 +122,7 @@ Presenter Overlay spike that decides the capture design.
 - [X] T037 Implement encoder selection in `apps/macos/Sources/RecordMac/Capture/EncoderSelection.swift`: for each codec and exact output format, create a compression session with `RequireHardwareAcceleratedVideoEncoder = true`, read back `UsingHardwareAcceleratedVideoEncoder`, and record the encoder ID and OS version; on failure select the software encoder explicitly with `EnableHardwareAcceleratedVideoEncoder = false` and report the reduction (Principle III, FR-071, research.md R-006)
 - [X] T038 [P] Write genuine software-fallback tests in `apps/macos/Tests/RecordMacTests/Capture/EncoderFallbackTests.swift`: for H.264, HEVC, HEVC with alpha, ProRes 422, and ProRes 4444, force the software path, assert the session reports a software encoder, encode frames, and decode the output with AVFoundation
 - [x] T039 [P] Write pause lifecycle tests in `apps/macos/Tests/RecordMacTests/Capture/PauseLifecycleTests.swift` covering legal and rejected transitions, stop while paused, and media and telemetry staying aligned across a pause
-- [ ] T040 [P] Write clock alignment tests in `apps/macos/Tests/RecordMacTests/Capture/TrackAlignmentTests.swift` measuring offset and drift between screen, microphone, system audio, and camera timestamps, including after a pause
+- [x] T040 [P] Write clock alignment tests in `apps/macos/Tests/RecordMacTests/Capture/TrackAlignmentTests.swift` measuring offset and drift between screen, microphone, system audio, and camera timestamps, including after a pause
 
 ### Telemetry (new, plus Screenize's model)
 
