@@ -12,6 +12,16 @@ struct ResolvedCaptureSource {
     var geometry: CaptureSourceGeometry
     /// The `deviceID` of the screen segments.
     var deviceID: String
+    /// Where capture found the source; nil only for a source made up in a test.
+    var location: CaptureSourceLocator.Location? = nil
+    /// The filter's point-to-pixel scale (`SCContentFilter.pointPixelScale`); nil only for a
+    /// source made up in a test.
+    var pointPixelScale: Double? = nil
+
+    /// The frame capture was prepared to produce, for telemetry; nil without a scale.
+    var preparedFrame: CaptureFrameGeometry? {
+        pointPixelScale.map { CaptureFrameGeometry(geometry, pointPixelScale: $0) }
+    }
 }
 
 /// The part of `SCStream` the backend uses, so its lifecycle is testable without a stream. The
@@ -51,6 +61,7 @@ struct ScreenCaptureBackendReport {
     var streamStopped: (reason: String, at: CMTime?)?
     var startFailure: String?
     var stopCaptureFailure: String?
+    var telemetry = BackendTelemetryReport()
 
     /// The selected audio sources that wrote no sample, so have no track.
     var audioWithoutSamples: [AudioCaptureSource] {
@@ -81,6 +92,11 @@ struct ScreenCaptureBackendReport {
 /// stopped on its own before that, the session ends where it stopped: `stop` returns what was
 /// captured with `endedEarlyAt` set, and `report` says why. `stop` finalises everything that
 /// was created, also after a failed start.
+///
+/// Activity telemetry runs beside the media, made by `telemetry` once the stream has started, on
+/// the same session clock; `stop` ends it right after the clock's end, before the stream and the
+/// writers are stopped, and `report.telemetry` holds what it collected and why it may be
+/// incomplete. Telemetry never fails or holds back the media.
 @MainActor
 final class ScreenCaptureBackend: CaptureBackend {
     /// Throws a `CapturePrepareError`.
@@ -97,6 +113,7 @@ final class ScreenCaptureBackend: CaptureBackend {
     private let encoders: EncoderSelector
     private let queue = DispatchQueue(label: "local.recordmac.capture.samples")
     let stopObserver: StreamStopObserver
+    private let hostTimeNow: () -> CMTime
 
     private var options: CaptureEngineOptions?
     private var resolved: ResolvedCaptureSource?
@@ -108,6 +125,8 @@ final class ScreenCaptureBackend: CaptureBackend {
     private var screen: ScreenSegmentWriter?
     private var audio: AudioSourceWriters?
     private var segmentFiles: ScreenSegmentFiles?
+    private let makeTelemetry: BackendTelemetryFactory?
+    private var telemetry: BackendTelemetry?
 
     init(
         directory: URL,
@@ -116,9 +135,13 @@ final class ScreenCaptureBackend: CaptureBackend {
         hasPermission: @escaping () -> Bool = { CGPreflightScreenCaptureAccess() },
         microphonePermitted: @escaping () -> Bool = { AVCaptureDevice.authorizationStatus(for: .audio) == .authorized },
         encoders: EncoderSelector = EncoderSelector(),
-        hostTimeNow: @escaping () -> CMTime = CaptureClock.hostTimeNow
+        hostTimeNow: @escaping () -> CMTime = CaptureClock.hostTimeNow,
+        telemetry: BackendTelemetryFactory? = ScreenCaptureBackend.systemTelemetry
     ) {
         self.directory = directory
+        self.hostTimeNow = hostTimeNow
+        makeTelemetry = telemetry
+        if telemetry == nil { report.telemetry.status = .disabled }
         stopObserver = StreamStopObserver(hostTimeNow: hostTimeNow)
         self.resolve = resolve ?? { try await ScreenCaptureSourceResolver.resolve($0) }
         self.makeStream = makeStream ?? { resolved, configuration, delegate in
@@ -198,11 +221,31 @@ final class ScreenCaptureBackend: CaptureBackend {
             report.startFailure = "\(error)"
             throw error
         }
+        startTelemetry(clock: clock, resolved: resolved)
+    }
+
+    /// Runs only once the stream has started, so a failed start leaves no telemetry running.
+    /// Activity is collected from this moment, which `report.telemetry.startedAt` records, not
+    /// from the epoch.
+    private func startTelemetry(clock: CaptureClock, resolved: ResolvedCaptureSource) {
+        guard let makeTelemetry else { return }
+        do {
+            let telemetry = try makeTelemetry(clock, resolved)
+            report.telemetry.startedAt = hostTimeNow()
+            try telemetry.start()
+            self.telemetry = telemetry
+            report.telemetry.status = .running
+        } catch {
+            report.telemetry.status = .failed("start: \(error)")
+        }
     }
 
     func pause(atHostTime hostTime: CMTime) async throws {}
 
-    func resume(atHostTime hostTime: CMTime) async throws {}
+    /// The engine has already resumed the clock at `hostTime`.
+    func resume(atHostTime hostTime: CMTime) async throws {
+        telemetry?.didResume(atHostTime: hostTime)
+    }
 
     func stop(atHostTime hostTime: CMTime) async throws -> [MediaTrack] {
         // The session ends before the stream is told to stop, so nothing stamped at or after the
@@ -211,6 +254,8 @@ final class ScreenCaptureBackend: CaptureBackend {
         let early = stopObserver.stopped.flatMap { stopped in stopped.hostTime.flatMap { $0 < hostTime ? $0 : nil } }
         clock?.end(atHostTime: early ?? hostTime)
         let end = clock?.snapshot().sessionTime(endingAt: hostTime) ?? .zero
+        // Before the media shutdown, so no activity is admitted while it runs.
+        await stopTelemetry(endingAt: end)
         if let stream, captureStarted {
             do { try await stream.stopCapture() } catch { report.stopCaptureFailure = "\(error)" }
         }
@@ -221,6 +266,11 @@ final class ScreenCaptureBackend: CaptureBackend {
         if let screen { report.screen = await screen.finish(at: end) }
         if let audio { report.audio = await audio.finish() }
         report.encoders = segmentFiles?.selections ?? []
+        if let resolved, let screen = report.screen {
+            report.telemetry.checkFrameSizes(
+                prepared: PixelSize(width: resolved.geometry.pixelWidth, height: resolved.geometry.pixelHeight),
+                seen: screen.segments.map { PixelSize(width: $0.format.width, height: $0.format.height) })
+        }
 
         var tracks: [MediaTrack] = []
         let endedEarlyAt = early == nil ? nil : end.seconds
@@ -244,6 +294,119 @@ final class ScreenCaptureBackend: CaptureBackend {
                 endedEarlyAt: endedEarlyAt))
         }
         return tracks
+    }
+}
+
+extension ScreenCaptureBackend {
+    /// Stops telemetry and keeps its outcome, bounded to the recording's end.
+    private func stopTelemetry(endingAt end: CMTime) async {
+        guard let telemetry else { return }
+        self.telemetry = nil
+        do {
+            report.telemetry.take(try await telemetry.stop(), endingAt: end.seconds)
+        } catch {
+            report.telemetry.status = .failed("stop: \(error)")
+        }
+    }
+
+    /// The real telemetry: a `TelemetrySession` on the system's tap, frontmost-window source, and
+    /// geometry observer, starting from the source's geometry read now. Throws when the source
+    /// has no location or scale, or its geometry cannot be read.
+    static let systemTelemetry: BackendTelemetryFactory = { clock, resolved in
+        guard let location = resolved.location, let frame = resolved.preparedFrame else {
+            throw BackendTelemetryError.sourceNotLocated
+        }
+        let target = SourceGeometryTarget(location, geometry: resolved.geometry)
+        let platform = SystemSourceGeometryPlatform()
+        let reading = target.read(displays: platform.displays(), windowBounds: { platform.windowBounds($0) }, frame: frame)
+        guard case .geometry(let initial) = reading else {
+            if case .unavailable(let reason) = reading { throw BackendTelemetryError.noInitialGeometry(reason) }
+            throw BackendTelemetryError.sourceNotLocated
+        }
+        return try TelemetrySession(
+            clock: clock, target: target, initial: initial, frame: { frame }, filter: ActivityEventFilter())
+    }
+}
+
+/// The telemetry the backend runs beside its media, so it can be replaced in tests.
+@MainActor
+protocol BackendTelemetry: AnyObject {
+    @discardableResult func start() throws -> TelemetryRecorderStatus
+    func didResume(atHostTime hostTime: CMTime)
+    func stop() async throws -> TelemetryOutcome
+}
+
+extension TelemetrySession: BackendTelemetry {}
+
+/// Makes a recording's telemetry once its stream has started; nil in place of one disables it.
+typealias BackendTelemetryFactory = @MainActor (CaptureClock, ResolvedCaptureSource) throws -> BackendTelemetry
+
+enum BackendTelemetryError: Error, Equatable {
+    /// The resolved source has no location or scale to observe.
+    case sourceNotLocated
+    case noInitialGeometry(SourceGeometryUnavailable)
+}
+
+/// Why telemetry collected within this slice may still not describe the recording.
+enum TelemetryIncompleteness: Equatable, Sendable {
+    /// The screen produced frames at a size other than the prepared one, which every geometry
+    /// segment assumes, so pointer locations would map with the wrong frame size.
+    case frameSizeChanged(prepared: PixelSize, seen: [PixelSize])
+}
+
+/// What became of a recording's activity telemetry.
+///
+/// `recorded` means collected within what the backend does today, not a full account: activity
+/// is collected from `startedAt`, not from the epoch; after a resume, events before the fresh
+/// geometry reading map with the geometry in force before the pause; and geometry segments are not
+/// aligned with screen media segment boundaries.
+struct BackendTelemetryReport: Equatable {
+    enum Status: Equatable {
+        /// Never started: the stream did not start, or nothing was recorded yet.
+        case notStarted
+        /// Turned off by the backend's owner.
+        case disabled
+        case running
+        /// Made, started, or stopped with an error; the outcome, if any, is from before it.
+        case failed(String)
+        case recorded
+        case incomplete([TelemetryIncompleteness])
+    }
+
+    var status = Status.notStarted
+    /// The frozen stream and counts, bounded to the recording's end.
+    var outcome: TelemetryOutcome?
+    /// Host time telemetry started.
+    var startedAt: CMTime?
+    /// Events and geometry segments collected at or after the recording's end and left out:
+    /// collected between a source loss and the stop, before the clock ended.
+    var removedAfterEnd = RemovedAfterEnd()
+
+    struct RemovedAfterEnd: Equatable {
+        var events = 0
+        var geometry = 0
+    }
+
+    /// Keeps `outcome` with every event at or after `end` left out, and every geometry segment
+    /// starting at or after it except the first, which starts at zero.
+    mutating func take(_ outcome: TelemetryOutcome, endingAt end: TimeInterval) {
+        var bounded = outcome
+        bounded.stream.events = outcome.stream.events.filter { $0.timestamp < end }
+        bounded.stream.geometry = outcome.stream.geometry.enumerated()
+            .filter { $0.offset == 0 || $0.element.start < end }.map(\.element)
+        removedAfterEnd = RemovedAfterEnd(
+            events: outcome.stream.events.count - bounded.stream.events.count,
+            geometry: outcome.stream.geometry.count - bounded.stream.geometry.count)
+        self.outcome = bounded
+        status = .recorded
+    }
+
+    /// Marks a recorded outcome incomplete when the screen produced any size but the prepared one.
+    mutating func checkFrameSizes(prepared: PixelSize, seen: [PixelSize]) {
+        guard status == .recorded else { return }
+        var other: [PixelSize] = []
+        for size in seen where size != prepared && !other.contains(size) { other.append(size) }
+        if !other.isEmpty { status = .incomplete([.frameSizeChanged(prepared: prepared, seen: other)]) }
     }
 }
 
@@ -338,17 +501,17 @@ enum ScreenCaptureSourceResolver {
                 }
                 return ResolvedCaptureSource(filter: filter,
                     geometry: try .area(area, displayFrame: frame, scale: CGFloat(filter.pointPixelScale)),
-                    deviceID: "display:\(id)")
+                    deviceID: "display:\(id)", location: location, pointPixelScale: Double(filter.pointPixelScale))
             }
             return ResolvedCaptureSource(filter: filter,
                 geometry: try .whole(pointSize: filter.contentRect.size, scale: CGFloat(filter.pointPixelScale)),
-                deviceID: "display:\(id)")
+                deviceID: "display:\(id)", location: location, pointPixelScale: Double(filter.pointPixelScale))
         case .window(let id):
             let window = content.windows.first { $0.windowID == id }!
             let filter = SCContentFilter(desktopIndependentWindow: window)
             return ResolvedCaptureSource(filter: filter,
                 geometry: try .whole(pointSize: filter.contentRect.size, scale: CGFloat(filter.pointPixelScale)),
-                deviceID: "window:\(id)")
+                deviceID: "window:\(id)", location: location, pointPixelScale: Double(filter.pointPixelScale))
         }
     }
 

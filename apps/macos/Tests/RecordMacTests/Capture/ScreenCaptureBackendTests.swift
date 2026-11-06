@@ -42,7 +42,9 @@ final class ScreenCaptureBackendTests: XCTestCase {
             includesPointer: false, frameRate: rate, wantsAlpha: false, keepsPresenterComposite: false)
     }
 
-    private func backend(resolve: ScreenCaptureBackend.Resolve? = nil) -> ScreenCaptureBackend {
+    private func backend(
+        resolve: ScreenCaptureBackend.Resolve? = nil, telemetry: BackendTelemetryFactory? = nil
+    ) -> ScreenCaptureBackend {
         let stream = stream!
         return ScreenCaptureBackend(
             directory: directory,
@@ -56,7 +58,8 @@ final class ScreenCaptureBackendTests: XCTestCase {
                 microphoneChecks += 1
                 return microphonePermitted
             },
-            hostTimeNow: { [unowned self] in now })
+            hostTimeNow: { [unowned self] in now },
+            telemetry: telemetry)
     }
 
     private func frame(at seconds: Double, width: Int = 256, height: Int = 144) throws -> CMSampleBuffer {

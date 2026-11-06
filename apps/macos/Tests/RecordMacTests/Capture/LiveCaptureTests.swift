@@ -122,7 +122,7 @@ final class LiveCaptureTests: XCTestCase {
         var backend: ScreenCaptureBackend!
         let engine = CaptureEngine(
             makeBackend: { _ in
-                backend = ScreenCaptureBackend(directory: recordingDirectory)
+                backend = ScreenCaptureBackend(directory: recordingDirectory, telemetry: nil)
                 return backend
             },
             refreshRate: { [display] _ in CoreGraphicsDisplayRefreshSource().refreshRate(of: display) })

@@ -151,7 +151,8 @@ final class PauseLifecycleTests: XCTestCase {
                 },
                 makeStream: { _, _, _ in stream },
                 hasPermission: { true },
-                microphonePermitted: { true }),
+                microphonePermitted: { true },
+                telemetry: nil),
             telemetryStopped: expectation(description: "telemetry stopped"))
         let backend = backend!
         engine = CaptureEngine(makeBackend: { _ in backend }, refreshRate: { _ in .hertz(60) },
