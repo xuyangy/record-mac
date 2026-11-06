@@ -30,6 +30,7 @@ final class CaptureDriver {
     @ObservationIgnored private var effectObserver: ([CaptureEffect]) -> Void = { _ in }
     @ObservationIgnored private var effectHandlers = CaptureEffectHandlers()
     @ObservationIgnored private var recordingStartTask: Task<Void, Never>?
+    @ObservationIgnored private var recordingStartTaskID: UUID?
     @ObservationIgnored private var screenshotCaptureTask: Task<Void, Never>?
 
     init(initialState: CaptureState = .choosingMode) {
@@ -97,9 +98,14 @@ final class CaptureDriver {
                 effectHandlers.prepareRecordingFile(source)
             case .runRecordingStart(let source, let outputURL):
                 recordingStartTask?.cancel()
+                // A start that returns after a newer one replaced it leaves the newer one's task,
+                // so the newer start can still be cancelled.
+                let id = UUID()
+                recordingStartTaskID = id
                 recordingStartTask = Task { [weak self] in
                     await self?.effectHandlers.runRecordingStart(source, outputURL)
                     await MainActor.run {
+                        guard self?.recordingStartTaskID == id else { return }
                         self?.recordingStartTask = nil
                     }
                 }

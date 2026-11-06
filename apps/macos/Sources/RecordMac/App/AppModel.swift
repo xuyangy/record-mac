@@ -220,6 +220,10 @@ final class AppModel: ObservableObject {
     private var capturePreflightTask: Task<Void, Never>?
     private var capturePreflightGeneration = 0
     private var pendingRecordingOptions: RecordingCaptureOptions?
+    /// The route chosen when the recording was requested; nil reads the opt-in at start.
+    private var pendingCaptureRoute: CaptureRoute?
+    /// The pipeline recording under way: stop finalises it, whatever the opt-in says by then.
+    private var activePipelineRecording: ActivePipelineRecording?
     private var recordingFilePreparationTask: Task<Void, Never>?
     private var captureDeviceRefreshTask: Task<Void, Never>?
     private var captureDeviceRefreshGeneration = 0
@@ -261,6 +265,13 @@ final class AppModel: ObservableObject {
     private let screenshotCapture: @MainActor (CaptureSource, URL) throws -> Void
     private let startRecordingCapture: @MainActor (CaptureSource, URL, RecordingCaptureOptions) async throws -> Date
     private let stopRecordingCapture: @MainActor () async throws -> URL
+    private let capturePipelineEnabled: @MainActor () -> Bool
+    private let makeRecordingPipeline: @MainActor (URL, ActivityEventFilter) -> RecordingPipeline
+    let capturePipelineLocations: CapturePipelineRoute.Locations
+    /// The filter every pipeline recording's activity passes.
+    let activityFilter = ActivityEventFilter()
+    /// The last recording the pipeline finalised, kept whether or not its project was written.
+    private(set) var lastFinalizedRecording: FinalizedRecording?
     private let rememberScreenshot: @Sendable (URL) throws -> Void
     private let trashProjectFile: @MainActor (URL) throws -> Void
     private let forgetProject: @Sendable (String) throws -> Void
@@ -309,6 +320,9 @@ final class AppModel: ObservableObject {
         registerImportedMedia: (@Sendable (EditorMediaKind, String, Data) throws -> ProjectSummary)? = nil,
         registerCapturedMedia: (@Sendable (String, Data) throws -> ProjectSummary)? = nil,
         prepareRecordingFilePath: (@Sendable (String) throws -> PreparedFile)? = nil,
+        capturePipelineEnabled: (@MainActor () -> Bool)? = nil,
+        makeRecordingPipeline: (@MainActor (URL, ActivityEventFilter) -> RecordingPipeline)? = nil,
+        capturePipelineLocations: CapturePipelineRoute.Locations? = nil,
         library: LegacyProjectLibraryStore = .standard()
     ) {
         let capture = CaptureController(screenRecordingPermission: screenRecordingPermission)
@@ -341,6 +355,13 @@ final class AppModel: ObservableObject {
         self.stopRecordingCapture = stopRecording ?? {
             try await capture.stopRecording()
         }
+        self.capturePipelineEnabled = capturePipelineEnabled ?? { CapturePipelineRoute.isEnabled() }
+        self.makeRecordingPipeline = makeRecordingPipeline ?? { directory, filter in
+            RecordingPipeline(captureDirectory: directory, activityFilter: filter, refreshRate: {
+                CapturePipelineRoute.refreshRate(of: $0, displays: CoreGraphicsDisplayRefreshSource())
+            })
+        }
+        self.capturePipelineLocations = capturePipelineLocations ?? .beside(library.locations)
         self.prepareCameraPermission = prepareCameraPermission
         self.prepareFacecamRecording = prepareFacecamRecording
         self.startFacecamRecording = startFacecamRecording
@@ -1080,6 +1101,7 @@ final class AppModel: ObservableObject {
             self.captureOptions.send(.availabilityChanged(self.canChangeRecordingOptions))
             guard self.isRecordingSetup(for: source) else {
                 self.pendingRecordingOptions = nil
+                self.pendingCaptureRoute = nil
                 return
             }
             switch outcome {
@@ -1087,6 +1109,7 @@ final class AppModel: ObservableObject {
                 self.dispatch(.recordingFilePrepared(source, outputURL))
             case .failure(let message):
                 self.pendingRecordingOptions = nil
+                self.pendingCaptureRoute = nil
                 self.dispatch(.recordingFilePreparationFailed(source, message: message))
             }
         }
@@ -1281,6 +1304,7 @@ final class AppModel: ObservableObject {
         recordingFilePreparationTask?.cancel()
         recordingFilePreparationTask = nil
         pendingRecordingOptions = nil
+        pendingCaptureRoute = nil
         isCapturePreflightRunning = false
         captureOptions.send(.availabilityChanged(canChangeRecordingOptions))
         dispatch(.cancelCapture)
@@ -1498,11 +1522,19 @@ final class AppModel: ObservableObject {
             return
         }
 
+        let options = currentCaptureOptions
+        let route: CaptureRoute = capturePipelineEnabled() ? .pipeline : .legacy
+        if route == .pipeline, options.includeCamera {
+            statusMessage = CapturePipelineRoute.Refusal.camera.message
+            showHUD()
+            return
+        }
+
         capturePreflightTask?.cancel()
         capturePreflightGeneration += 1
         let generation = capturePreflightGeneration
-        let options = currentCaptureOptions
         pendingRecordingOptions = options
+        pendingCaptureRoute = route
         isCapturePreflightRunning = true
         captureOptions.send(.availabilityChanged(false))
         statusMessage = "Checking capture readiness…"
@@ -1560,6 +1592,14 @@ final class AppModel: ObservableObject {
     }
 
     private func runRecordingStartFlow(source selectedSource: CaptureSource, outputURL: URL) async {
+        let route = pendingCaptureRoute ?? (capturePipelineEnabled() ? .pipeline : .legacy)
+        pendingCaptureRoute = nil
+        if route == .pipeline {
+            let options = pendingRecordingOptions ?? currentCaptureOptions
+            pendingRecordingOptions = nil
+            await runPipelineStartFlow(source: selectedSource, outputURL: outputURL, options: options)
+            return
+        }
         do {
             var options = pendingRecordingOptions ?? currentCaptureOptions
             pendingRecordingOptions = nil
@@ -1710,6 +1750,10 @@ final class AppModel: ObservableObject {
     }
 
     private func runRecordingStopFlow(source: CaptureSource?) async {
+        if let recording = activePipelineRecording {
+            await runPipelineStopFlow(recording, source: source)
+            return
+        }
         let performanceLog = Logger(subsystem: "dev.openrecorder.app", category: "RecordingLatency")
         let stopStart = ProcessInfo.processInfo.systemUptime
         let editorSessionAtStop = appShell.state.lastEditorSession?.id
@@ -1803,6 +1847,102 @@ final class AppModel: ObservableObject {
         activeRecordingStartDate = nil
         activeFacecamStartedAt = nil
         activeFacecamURL = nil
+    }
+
+    /// Records through `RecordingPipeline` (`CapturePipelineRoute`). No legacy screen, camera,
+    /// cursor, or audio-feedback recorder runs, and nothing reaches the legacy library or editor.
+    private func runPipelineStartFlow(source: CaptureSource, outputURL: URL, options: RecordingCaptureOptions) async {
+        let engineOptions: CaptureEngineOptions
+        switch CapturePipelineRoute.engineOptions(options, microphones: captureOptions.state.microphoneDevices) {
+        case .success(let resolved):
+            engineOptions = resolved
+        case .failure(let refusal):
+            restoreRecordingSetup(source: source, message: refusal.message)
+            return
+        }
+        do {
+            try await runRecordingCountdown(source)
+        } catch is CancellationError {
+            countdownOverlayController.dismiss()
+            if recordingPhase == .countingDown {
+                restoreRecordingSetup(source: source, message: "Recording canceled.")
+            }
+            return
+        } catch {
+            restoreRecordingSetup(source: source, message: error.localizedDescription)
+            return
+        }
+        guard !Task.isCancelled else { return }
+
+        dispatch(.recordingStarting(source))
+        let directory = capturePipelineLocations.captures.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let pipeline = makeRecordingPipeline(directory, activityFilter)
+        let recording = ActivePipelineRecording(
+            pipeline: pipeline, name: outputURL.deletingPathExtension().lastPathComponent, source: source,
+            startedAt: Date())
+        activePipelineRecording = recording
+        // A start cancelled while it ran, or replaced by a newer one, changes no state it no longer
+        // owns, and a pipeline it started is finalised and left in its capture directory.
+        do {
+            _ = try await pipeline.start(source, engineOptions)
+        } catch {
+            guard activePipelineRecording?.id == recording.id else { return }
+            activePipelineRecording = nil
+            guard !Task.isCancelled else { return }
+            restoreRecordingSetup(source: source, message: CapturePipelineRoute.startFailureMessage(error))
+            return
+        }
+        guard activePipelineRecording?.id == recording.id, !Task.isCancelled else {
+            if activePipelineRecording?.id == recording.id { activePipelineRecording = nil }
+            do {
+                _ = try await pipeline.finalize()
+                pipelineLog.notice("A cancelled recording start was finalized; its capture is in \(pipeline.captureDirectory.path, privacy: .public)")
+            } catch {
+                pipelineLog.error("A cancelled recording start could not be finalized: \(String(describing: error), privacy: .public); its capture is in \(pipeline.captureDirectory.path, privacy: .public)")
+            }
+            return
+        }
+        activeRecordingStartDate = recording.startedAt
+        let shouldStopAfterStart: Bool
+        if case .startingRecording(_, let stopRequested) = captureState.phase {
+            shouldStopAfterStart = stopRequested
+        } else {
+            shouldStopAfterStart = false
+        }
+        dispatch(.recordingStarted(source))
+        if shouldStopAfterStart {
+            stopRecording()
+        }
+    }
+
+    /// Finalises the pipeline recording once and writes its project. A capture that ended on its
+    /// own, or whose activity was not recorded, writes no project; its files stay where the message
+    /// says, and `lastFinalizedRecording` keeps it.
+    private func runPipelineStopFlow(_ recording: ActivePipelineRecording, source: CaptureSource?) async {
+        activeRecordingStartDate = nil
+        let finalized: FinalizedRecording
+        do {
+            finalized = try await recording.pipeline.finalize()
+        } catch {
+            activePipelineRecording = nil
+            dispatch(.recordingFailed(source, message:
+                "The recording could not be finalized: \(error). The capture files are in \(recording.pipeline.captureDirectory.path)."))
+            return
+        }
+        activePipelineRecording = nil
+        lastFinalizedRecording = finalized
+        let metadata = RecordingMetadata(
+            id: UUID(), displayName: recording.name, createdAt: recording.startedAt,
+            sourceDescription: (source ?? recording.source).name)
+        let message: String
+        do {
+            try FileManager.default.createDirectory(at: capturePipelineLocations.projects, withIntermediateDirectories: true)
+            let result = try finalized.publish(named: recording.name, in: capturePipelineLocations.projects, metadata: metadata)
+            message = CapturePipelineRoute.savedMessage(result)
+        } catch {
+            message = CapturePipelineRoute.notPublishedMessage(error, captureDirectory: finalized.captureDirectory)
+        }
+        dispatch(.recordingStopped(message: message))
     }
 
     func takeScreenshot() {
@@ -2857,6 +2997,7 @@ final class AppModel: ObservableObject {
         guard generation == capturePreflightGeneration else { return }
         capturePreflightTask = nil
         pendingRecordingOptions = nil
+        pendingCaptureRoute = nil
         isCapturePreflightRunning = false
         captureOptions.send(.availabilityChanged(canChangeRecordingOptions))
     }
@@ -3024,4 +3165,22 @@ private struct DisplayFlashOverlay: View {
             .background(flashColor.opacity(0.10))
             .ignoresSafeArea()
     }
+}
+
+/// Which capture a recording uses, chosen once when it is requested.
+private enum CaptureRoute {
+    case legacy
+    case pipeline
+}
+
+/// A pipeline recording from its start until its stop.
+private let pipelineLog = Logger(subsystem: "dev.openrecorder.app", category: "CapturePipeline")
+
+private struct ActivePipelineRecording {
+    let id = UUID()
+    let pipeline: RecordingPipeline
+    /// The project's name and display name: the prepared recording file's stem.
+    let name: String
+    let source: CaptureSource
+    let startedAt: Date
 }
