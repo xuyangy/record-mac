@@ -96,7 +96,9 @@ struct ScreenCaptureBackendReport {
 /// Activity telemetry runs beside the media, made by `telemetry` once the stream has started, on
 /// the same session clock; `stop` ends it right after the clock's end, before the stream and the
 /// writers are stopped, and `report.telemetry` holds what it collected and why it may be
-/// incomplete. Telemetry never fails or holds back the media.
+/// incomplete. Telemetry never fails or holds back the media. Its pointer and window events pass
+/// `activityFilter`, which the owner may share with `ActivitySuspensionShortcut` so the shortcut
+/// suspends this recording's activity; the backend never changes the filter's state.
 @MainActor
 final class ScreenCaptureBackend: CaptureBackend {
     /// Throws a `CapturePrepareError`.
@@ -126,6 +128,8 @@ final class ScreenCaptureBackend: CaptureBackend {
     private var audio: AudioSourceWriters?
     private var segmentFiles: ScreenSegmentFiles?
     private let makeTelemetry: BackendTelemetryFactory?
+    /// The filter every recording of this backend's telemetry uses.
+    let activityFilter: ActivityEventFilter
     private var telemetry: BackendTelemetry?
 
     init(
@@ -136,8 +140,10 @@ final class ScreenCaptureBackend: CaptureBackend {
         microphonePermitted: @escaping () -> Bool = { AVCaptureDevice.authorizationStatus(for: .audio) == .authorized },
         encoders: EncoderSelector = EncoderSelector(),
         hostTimeNow: @escaping () -> CMTime = CaptureClock.hostTimeNow,
-        telemetry: BackendTelemetryFactory? = ScreenCaptureBackend.systemTelemetry
+        telemetry: BackendTelemetryFactory? = ScreenCaptureBackend.systemTelemetry,
+        activityFilter: ActivityEventFilter = ActivityEventFilter()
     ) {
+        self.activityFilter = activityFilter
         self.directory = directory
         self.hostTimeNow = hostTimeNow
         makeTelemetry = telemetry
@@ -230,9 +236,11 @@ final class ScreenCaptureBackend: CaptureBackend {
     private func startTelemetry(clock: CaptureClock, resolved: ResolvedCaptureSource) {
         guard let makeTelemetry else { return }
         do {
-            let telemetry = try makeTelemetry(clock, resolved)
+            let telemetry = try makeTelemetry(clock, resolved, activityFilter)
             report.telemetry.startedAt = hostTimeNow()
+            let suspended = activityFilter.isSuspended
             try telemetry.start()
+            report.telemetry.suspendedAtStart = suspended
             self.telemetry = telemetry
             report.telemetry.status = .running
         } catch {
@@ -310,9 +318,10 @@ extension ScreenCaptureBackend {
     }
 
     /// The real telemetry: a `TelemetrySession` on the system's tap, frontmost-window source, and
-    /// geometry observer, starting from the source's geometry read now. Throws when the source
-    /// has no location or scale, or its geometry cannot be read.
-    static let systemTelemetry: BackendTelemetryFactory = { clock, resolved in
+    /// geometry observer, starting from the source's geometry read now, with the backend's
+    /// activity filter. Throws when the source has no location or scale, or its geometry cannot be
+    /// read.
+    static let systemTelemetry: BackendTelemetryFactory = { clock, resolved, filter in
         guard let location = resolved.location, let frame = resolved.preparedFrame else {
             throw BackendTelemetryError.sourceNotLocated
         }
@@ -324,7 +333,7 @@ extension ScreenCaptureBackend {
             throw BackendTelemetryError.sourceNotLocated
         }
         return try TelemetrySession(
-            clock: clock, target: target, initial: initial, frame: { frame }, filter: ActivityEventFilter())
+            clock: clock, target: target, initial: initial, frame: { frame }, filter: filter)
     }
 }
 
@@ -338,8 +347,9 @@ protocol BackendTelemetry: AnyObject {
 
 extension TelemetrySession: BackendTelemetry {}
 
-/// Makes a recording's telemetry once its stream has started; nil in place of one disables it.
-typealias BackendTelemetryFactory = @MainActor (CaptureClock, ResolvedCaptureSource) throws -> BackendTelemetry
+/// Makes a recording's telemetry once its stream has started, with the filter its activity must
+/// pass; nil in place of one disables it.
+typealias BackendTelemetryFactory = @MainActor (CaptureClock, ResolvedCaptureSource, ActivityEventFilter) throws -> BackendTelemetry
 
 enum BackendTelemetryError: Error, Equatable {
     /// The resolved source has no location or scale to observe.
@@ -378,6 +388,9 @@ struct BackendTelemetryReport: Equatable {
     var outcome: TelemetryOutcome?
     /// Host time telemetry started.
     var startedAt: CMTime?
+    /// Whether the activity filter was suspended when telemetry started: that instant only, not
+    /// its state later. Nil when telemetry never started. Deliberate suspension, not a failure.
+    var suspendedAtStart: Bool?
     /// Events and geometry segments collected at or after the recording's end and left out:
     /// collected between a source loss and the stop, before the clock ended.
     var removedAfterEnd = RemovedAfterEnd()

@@ -1,5 +1,6 @@
 import AppKit
 import ApplicationServices
+import Carbon.HIToolbox
 import CoreMedia
 @preconcurrency import ScreenCaptureKit
 import XCTest
@@ -50,11 +51,76 @@ final class BackendTelemetryTests: XCTestCase {
         }
     }
 
+    /// Finds nothing, or holds one lookup until the test releases it.
     private final class NoAccessibility: AccessibilityQueries, @unchecked Sendable {
+        private let lock = NSLock()
+        private var gate: (entered: DispatchSemaphore, release: DispatchSemaphore)?
+
+        func hold() -> (entered: DispatchSemaphore, release: DispatchSemaphore) {
+            let gate = (entered: DispatchSemaphore(value: 0), release: DispatchSemaphore(value: 0))
+            lock.withLock { self.gate = gate }
+            return gate
+        }
+
         func isTrusted() -> Bool { true }
-        func element(at point: CGPoint) -> AccessibilityLookup { .none }
+        func element(at point: CGPoint) -> AccessibilityLookup {
+            if let gate = lock.withLock({ () -> (entered: DispatchSemaphore, release: DispatchSemaphore)? in
+                defer { gate = nil }
+                return gate
+            }) {
+                gate.entered.signal()
+                gate.release.wait()
+            }
+            return .none
+        }
         func focusedElement() -> AccessibilityLookup { .none }
         func copyAttribute(_ attribute: String, of element: AccessibilityElement) -> (AXError, CFTypeRef?) { (.noValue, nil) }
+    }
+
+    private final class FakeWindows: FrontmostWindowSource, @unchecked Sendable {
+        private let lock = NSLock()
+        private var onChange: (@Sendable (CMTime) -> Void)?
+        var window: WindowDescriptor?
+
+        func start(onChange: @escaping @Sendable (CMTime) -> Void) -> Bool {
+            lock.withLock { self.onChange = onChange }
+            return true
+        }
+
+        func stop() {}
+        func frontmostWindow() -> FrontmostWindowLookup { lock.withLock { window.map { .window($0) } ?? .unavailable } }
+
+        func observe(atHostSeconds seconds: Double) {
+            let onChange = lock.withLock { self.onChange }
+            onChange?(CMTime(seconds: seconds, preferredTimescale: 1_000_000_000))
+        }
+    }
+
+    /// Carbon stand-in: one handler, every registration accepted.
+    private final class FakeHotKeySystem: HotKeySystem {
+        private(set) var dispatch: ((EventHotKeyID, Bool) -> Bool)?
+        private(set) var ids: [EventHotKeyID] = []
+
+        func installHandler(_ dispatch: @escaping (EventHotKeyID, Bool) -> Bool) -> OSStatus {
+            self.dispatch = dispatch
+            return noErr
+        }
+
+        func removeHandler() { dispatch = nil }
+
+        func register(_ combination: ShortcutCombination, id: EventHotKeyID) -> (OSStatus, EventHotKeyRef?) {
+            ids.append(id)
+            return (noErr, EventHotKeyRef(bitPattern: ids.count))
+        }
+
+        func unregister(_ reference: EventHotKeyRef) {}
+
+        /// Presses and releases the last registered hot key, as the user would.
+        func pressAndRelease() {
+            guard let id = ids.last else { return }
+            _ = dispatch?(id, false)
+            _ = dispatch?(id, true)
+        }
     }
 
     private final class FakePlatform: SourceGeometryPlatform, @unchecked Sendable {
@@ -109,6 +175,8 @@ final class BackendTelemetryTests: XCTestCase {
     private var now = CMTime.zero
     private let tap = FakeTap()
     private let platform = FakePlatform()
+    private let windows = FakeWindows()
+    private let accessibility = NoAccessibility()
 
     override func setUp() async throws {
         directory = FileManager.default.temporaryDirectory.appendingPathComponent("backend-telemetry-\(UUID().uuidString)")
@@ -124,7 +192,9 @@ final class BackendTelemetryTests: XCTestCase {
     private let initial = SourceGeometry(sourceRect: CGRect(x: 0, y: 0, width: 256, height: 144),
         pixelSize: PixelSize(width: 256, height: 144), scaleFactor: 1)
 
-    private func backend(telemetry: BackendTelemetryFactory?) -> ScreenCaptureBackend {
+    private func backend(
+        telemetry: BackendTelemetryFactory?, activityFilter: ActivityEventFilter = ActivityEventFilter()
+    ) -> ScreenCaptureBackend {
         let stream = stream!
         return ScreenCaptureBackend(
             directory: directory,
@@ -136,19 +206,23 @@ final class BackendTelemetryTests: XCTestCase {
             hasPermission: { true },
             microphonePermitted: { true },
             hostTimeNow: { [unowned self] in now },
-            telemetry: telemetry)
+            telemetry: telemetry,
+            activityFilter: activityFilter)
     }
 
     /// A real session on the stand-ins, from the resolved source's target and prepared frame.
-    private func sessionFactory(made: ((CaptureClock) -> Void)? = nil) -> BackendTelemetryFactory {
-        let (tap, platform, initial) = (tap, platform, initial)
-        return { clock, resolved in
+    private func sessionFactory(
+        made: ((CaptureClock) -> Void)? = nil, filterGiven: ((ActivityEventFilter) -> Void)? = nil
+    ) -> BackendTelemetryFactory {
+        let (tap, platform, initial, windows, accessibility) = (tap, platform, initial, windows, accessibility)
+        return { clock, resolved, filter in
             made?(clock)
+            filterGiven?(filter)
             let frame = resolved.preparedFrame!
             return try TelemetrySession(
                 clock: clock, target: SourceGeometryTarget(resolved.location!, geometry: resolved.geometry),
-                initial: initial, frame: { frame }, filter: ActivityEventFilter(),
-                resolver: TargetResolver(accessibility: NoAccessibility()), tap: tap, windows: nil,
+                initial: initial, frame: { frame }, filter: filter,
+                resolver: TargetResolver(accessibility: accessibility), tap: tap, windows: windows,
                 observer: SourceGeometryObserver(platform: platform))
         }
     }
@@ -186,7 +260,7 @@ final class BackendTelemetryTests: XCTestCase {
         var madeWith: CaptureClock?
         let stream = stream!
         now = host(epoch + 0.05)
-        let backend = backend(telemetry: { clock, _ in
+        let backend = backend(telemetry: { clock, _, _ in
             madeWith = clock
             let made = SpyTelemetry(stream: stream)
             spy = made
@@ -227,7 +301,7 @@ final class BackendTelemetryTests: XCTestCase {
     /// A telemetry that cannot be made, or fails at its stop, is reported; the media are recorded
     /// and finalised all the same.
     func testATelemetryFailureNeverFailsTheMedia() async throws {
-        let refused = backend(telemetry: { _, _ in throw BackendTelemetryError.sourceNotLocated })
+        let refused = backend(telemetry: { _, _, _ in throw BackendTelemetryError.sourceNotLocated })
         try await started(refused, clock: CaptureClock(epochHostTime: host(epoch)))
         stream.deliver(try frame(at: 0.1), .screen)
         await drain(refused)
@@ -240,7 +314,7 @@ final class BackendTelemetryTests: XCTestCase {
         directory = directory.appendingPathExtension("second")
         stream = FakeCaptureStream()
         let stream = stream!
-        let failing = backend(telemetry: { _, _ in
+        let failing = backend(telemetry: { _, _, _ in
             let spy = SpyTelemetry(stream: stream)
             spy.failStop = true
             return spy
@@ -253,6 +327,99 @@ final class BackendTelemetryTests: XCTestCase {
         XCTAssertEqual(stream.stopCalls, 1)
         XCTAssertEqual(failing.report.frameReport?.written, 1)
         XCTAssertEqual(failing.report.telemetry.status, .failed("stop: \(TelemetrySessionError.alreadyStopped)"))
+    }
+
+    // MARK: Suspension
+
+    private nonisolated static func wait(for semaphore: DispatchSemaphore) { semaphore.wait() }
+
+    private let window = WindowDescriptor(bundleIdentifier: "com.example.editor", windowID: 7, frame: CGRect(x: 0, y: 0, width: 100, height: 100))
+
+    /// The shortcut and the recording share one filter. A move still resolving when the shortcut
+    /// suspends is kept; while suspended a move and a window observation are dropped, but a display
+    /// move is recorded; after the shortcut resumes, a move and a fresh window observation are
+    /// recorded. The window is only known again from that fresh observation, not from the toggle.
+    func testTheSuspensionShortcutSuspendsTheRecordingsActivity() async throws {
+        let filter = ActivityEventFilter()
+        let system = FakeHotKeySystem()
+        let shortcut = ActivitySuspensionShortcut(registrar: GlobalShortcutRegistrar(system: system), filter: filter)
+        shortcut.bind(ShortcutCombination(keyCode: UInt32(kVK_F17), modifiers: UInt32(cmdKey | optionKey)))
+        var given: ActivityEventFilter?
+        let backend = backend(telemetry: sessionFactory(filterGiven: { given = $0 }), activityFilter: filter)
+        try await started(backend, clock: CaptureClock(epochHostTime: host(epoch)))
+        platform.runMain()
+        XCTAssertTrue(given === filter, "the factory gets the backend's filter")
+        XCTAssertEqual(backend.report.telemetry.suspendedAtStart, false)
+
+        let gate = accessibility.hold()
+        tap.move(atHostSeconds: epoch + 0.1, to: CGPoint(x: 10, y: 10))
+        Self.wait(for: gate.entered)
+        system.pressAndRelease()
+        XCTAssertTrue(filter.isSuspended)
+        gate.release.signal()
+        windows.window = window
+        tap.move(atHostSeconds: epoch + 0.2, to: CGPoint(x: 20, y: 20))
+        windows.observe(atHostSeconds: epoch + 0.25)
+        platform.moveDisplay(atHostSeconds: epoch + 0.3)
+        system.pressAndRelease()
+        XCTAssertFalse(filter.isSuspended)
+        tap.move(atHostSeconds: epoch + 0.4, to: CGPoint(x: 40, y: 40))
+        windows.observe(atHostSeconds: epoch + 0.45)
+        _ = try await backend.stop(atHostTime: host(epoch + 0.9))
+
+        let outcome = try XCTUnwrap(backend.report.telemetry.outcome)
+        XCTAssertEqual(outcome.stream.events.map(\.kind), [.pointerMove, .pointerMove, .activeWindowChange])
+        XCTAssertEqual(outcome.stream.events.map(\.timestamp).map { ($0 * 100).rounded() / 100 }, [0.1, 0.4, 0.45])
+        XCTAssertEqual(outcome.stream.geometry.count, 2, "geometry goes on while suspended")
+        XCTAssertEqual(outcome.counts.droppedSuspended, 1)
+        XCTAssertEqual(outcome.counts.windows.droppedSuspended, 1)
+        XCTAssertEqual(backend.report.telemetry.status, .recorded, "suspension is not a failure")
+        XCTAssertEqual(backend.report.telemetry.suspendedAtStart, false, "the snapshot is of the start only")
+    }
+
+    /// A filter suspended before the first recording stays suspended through a pause and resume
+    /// and into a later recording of another backend, until its owner changes it.
+    func testASuspendedFilterStaysSuspendedUntilItsOwnerChangesIt() async throws {
+        let filter = ActivityEventFilter()
+        filter.setSuspended(true)
+        let clock = CaptureClock(epochHostTime: host(epoch))
+        let first = backend(telemetry: sessionFactory(), activityFilter: filter)
+        try await started(first, clock: clock)
+        platform.runMain()
+        XCTAssertEqual(first.report.telemetry.suspendedAtStart, true)
+        XCTAssertTrue(clock.pause(atHostTime: host(epoch + 0.2)))
+        XCTAssertTrue(clock.resume(atHostTime: host(epoch + 0.3)))
+        try await first.resume(atHostTime: host(epoch + 0.3))
+        platform.runMain()
+        XCTAssertTrue(filter.isSuspended, "a capture resume does not lift it")
+        tap.move(atHostSeconds: epoch + 0.4, to: CGPoint(x: 1, y: 1))
+        _ = try await first.stop(atHostTime: host(epoch + 0.9))
+        XCTAssertTrue(filter.isSuspended, "nor does the stop")
+        XCTAssertEqual(first.report.telemetry.outcome?.stream.events, [])
+
+        try? FileManager.default.removeItem(at: directory)
+        directory = directory.appendingPathExtension("second")
+        stream = FakeCaptureStream()
+        let second = backend(telemetry: sessionFactory(), activityFilter: filter)
+        try await started(second, clock: CaptureClock(epochHostTime: host(epoch)))
+        platform.runMain()
+        XCTAssertEqual(second.report.telemetry.suspendedAtStart, true)
+        tap.move(atHostSeconds: epoch + 0.1, to: CGPoint(x: 1, y: 1))
+        filter.setSuspended(false)
+        tap.move(atHostSeconds: epoch + 0.2, to: CGPoint(x: 2, y: 2))
+        _ = try await second.stop(atHostTime: host(epoch + 0.9))
+        XCTAssertEqual(second.report.telemetry.outcome?.stream.events.map(\.location), [CGPoint(x: 2, y: 2)])
+    }
+
+    /// Telemetry that never started has no snapshot.
+    func testNoSnapshotWithoutTelemetry() async throws {
+        let filter = ActivityEventFilter()
+        filter.setSuspended(true)
+        let disabled = backend(telemetry: nil, activityFilter: filter)
+        try await started(disabled, clock: CaptureClock(epochHostTime: host(epoch)))
+        _ = try await disabled.stop(atHostTime: host(epoch + 0.5))
+        XCTAssertNil(disabled.report.telemetry.suspendedAtStart)
+        XCTAssertTrue(filter.isSuspended)
     }
 
     // MARK: Bounds of the recording
@@ -367,7 +534,7 @@ final class BackendTelemetryTests: XCTestCase {
         let resolved = ResolvedCaptureSource(filter: nil, geometry: CaptureSourceGeometry(pixelWidth: 256, pixelHeight: 144, sourceRect: nil),
             deviceID: "display:1")
         XCTAssertNil(resolved.preparedFrame)
-        XCTAssertThrowsError(try ScreenCaptureBackend.systemTelemetry(CaptureClock(epochHostTime: host(epoch)), resolved)) {
+        XCTAssertThrowsError(try ScreenCaptureBackend.systemTelemetry(CaptureClock(epochHostTime: host(epoch)), resolved, ActivityEventFilter())) {
             XCTAssertEqual($0 as? BackendTelemetryError, .sourceNotLocated)
         }
     }
