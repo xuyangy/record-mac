@@ -371,6 +371,70 @@ final class SourceGeometryObserverTests: XCTestCase {
         XCTAssertTrue(platform.displayHandles.isEmpty)
     }
 
+    /// What a refresh's completion saw: its result, and whether it ran on the main thread.
+    private final class Completions: @unchecked Sendable {
+        private let lock = NSLock()
+        private var stored: [(delivered: Bool, onMain: Bool)] = []
+        var all: [(delivered: Bool, onMain: Bool)] { lock.withLock { stored } }
+        func add(_ delivered: Bool, onMain: Bool) { lock.withLock { stored.append((delivered, onMain)) } }
+    }
+
+    private func refresh(_ observer: SourceGeometryObserver, into completions: Completions) {
+        let platform = platform
+        observer.refresh { completions.add($0, onMain: platform.isMainThread()) }
+    }
+
+    /// Called off the main thread, a refresh reads nothing until the main thread runs; the
+    /// reading is stamped then, one tick after the start reading, and completes on main.
+    func testARefreshReadsOnTheMainThreadAndIsStampedWhenRead() {
+        let observer = started(.display(1))
+        let completions = Completions()
+        let reads = platform.reads
+        refresh(observer, into: completions)
+        XCTAssertEqual(platform.reads, reads, "queued, not yet read")
+        XCTAssertTrue(completions.all.isEmpty)
+        platform.attached[0].bounds.origin.x = 100
+        platform.runMain()
+        XCTAssertEqual(received.readings.last, geometry(CGRect(x: 100, y: 0, width: 1440, height: 900)))
+        XCTAssertEqual(received.all.map(\.hostTime.value), [101, 102])
+        XCTAssertEqual(completions.all.map(\.delivered), [true])
+        XCTAssertEqual(completions.all.map(\.onMain), [true])
+        observer.stop()
+        platform.runMain()
+    }
+
+    /// A refresh queued for one registration, which is then stopped and replaced, reads nothing
+    /// and never reads the replacement.
+    func testARefreshForAReplacedRegistrationReadsNothing() {
+        let observer = started(.display(1))
+        let completions = Completions()
+        refresh(observer, into: completions)
+        observer.stop()
+        let later = Received()
+        start(observer, .display(1)) { later.add($0) }
+        platform.runMain()
+        XCTAssertEqual(completions.all.map(\.delivered), [false])
+        XCTAssertEqual(completions.all.map(\.onMain), [true])
+        XCTAssertEqual(received.readings.count, 1, "only the first start reading")
+        XCTAssertEqual(later.readings.count, 1, "only its own start reading")
+        observer.stop()
+        platform.runMain()
+    }
+
+    /// With nothing running, a refresh off the main thread still completes on the main thread,
+    /// with false; on the main thread it completes at once.
+    func testARefreshWithNothingRunningCompletesOnTheMainThread() {
+        let observer = SourceGeometryObserver(platform: platform)
+        let completions = Completions()
+        refresh(observer, into: completions)
+        XCTAssertTrue(completions.all.isEmpty, "queued to the main thread")
+        platform.runMain()
+        platform.asMain { refresh(observer, into: completions) }
+        XCTAssertEqual(completions.all.map(\.delivered), [false, false])
+        XCTAssertEqual(completions.all.map(\.onMain), [true, true])
+        XCTAssertEqual(platform.reads, 0)
+    }
+
     /// Stopped before its setup ran: nothing is registered or read.
     func testStoppedBeforeSetupRegistersNothing() {
         let observer = SourceGeometryObserver(platform: platform)

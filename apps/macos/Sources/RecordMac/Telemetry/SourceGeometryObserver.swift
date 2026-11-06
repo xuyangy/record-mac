@@ -206,14 +206,17 @@ final class SourceGeometryObserver: @unchecked Sendable {
             deliver()
         }
 
-        /// Reads and delivers under the lock, so a stop on another thread waits for it.
-        func deliver() {
+        /// Reads and delivers under the lock, so a stop on another thread waits for it. Returns
+        /// false, reading nothing, once cancelled.
+        @discardableResult
+        func deliver() -> Bool {
             lock.withLock {
-                guard !cancelled else { return }
+                guard !cancelled else { return false }
                 let platform = platform
                 let reading = target.read(
                     displays: platform.displays(), windowBounds: { platform.windowBounds($0) }, frame: frame())
                 handler(SourceGeometryObservation(reading: reading, hostTime: platform.hostTimeNow()))
+                return true
             }
         }
 
@@ -262,6 +265,23 @@ final class SourceGeometryObserver: @unchecked Sendable {
             registration.setUp()
         } else {
             platform.onMain { registration.setUp() }
+        }
+    }
+
+    /// Takes one reading of the running registration now, as a trigger would, on the main
+    /// thread; queued there when called off it. The reading is stamped when it is taken, never
+    /// with the time of the call. It belongs to the registration running at the call: if that
+    /// one is stopped or replaced before the reading, nothing is read, and a later registration
+    /// is never read on its behalf. `completion` says whether a reading was delivered, false
+    /// with nothing running; it is always called on the main thread, at once when the call is made
+    /// there, queued there otherwise.
+    func refresh(completion: @escaping @Sendable (Bool) -> Void = { _ in }) {
+        let registration = lock.withLock { current }
+        let work: @Sendable () -> Void = { completion(registration?.deliver() ?? false) }
+        if platform.isMainThread() {
+            work()
+        } else {
+            platform.onMain(work)
         }
     }
 
